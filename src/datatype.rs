@@ -82,6 +82,7 @@ impl DataType {
         }
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     fn parse_integer(self, text: &str) -> Result<Vec<u8>, String> {
         let n = parse_int(text).ok_or_else(|| format!("`{text}` is not a valid integer"))?;
         let bits = (self.size() * 8) as u32;
@@ -154,7 +155,10 @@ mod tests {
         assert!(DataType::I8.parse_value("300").is_err());
         assert!(DataType::I8.parse_value("-129").is_err());
         assert!(DataType::I8.parse_value("255").is_ok()); // unsigned spelling
-        assert_eq!(DataType::I16.parse_value("0xFFFF").unwrap(), vec![0xff, 0xff]);
+        assert_eq!(
+            DataType::I16.parse_value("0xFFFF").unwrap(),
+            vec![0xff, 0xff]
+        );
         assert!(DataType::I64.parse_value("abc").is_err());
     }
 

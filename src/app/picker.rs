@@ -22,11 +22,18 @@ pub enum PickerAction {
 
 impl Picker {
     pub fn empty() -> Picker {
-        Picker { filter: String::new(), state: ListState::default(), all: Vec::new() }
+        Picker {
+            filter: String::new(),
+            state: ListState::default(),
+            all: Vec::new(),
+        }
     }
 
     pub fn open() -> Picker {
-        let mut picker = Picker { all: list_processes(), ..Picker::empty() };
+        let mut picker = Picker {
+            all: list_processes(),
+            ..Picker::empty()
+        };
         picker.clamp_selection();
         picker
     }
@@ -37,7 +44,9 @@ impl Picker {
         self.all
             .iter()
             .filter(|(pid, name)| {
-                needle.is_empty() || name.to_lowercase().contains(&needle) || pid.to_string().contains(&needle)
+                needle.is_empty()
+                    || name.to_lowercase().contains(&needle)
+                    || pid.to_string().contains(&needle)
             })
             .collect()
     }
@@ -61,7 +70,9 @@ impl Picker {
 
     fn chosen(&self) -> Option<(u32, String)> {
         let index = self.state.selected()?;
-        self.visible().get(index).map(|(pid, name)| (*pid, name.clone()))
+        self.visible()
+            .get(index)
+            .map(|(pid, name)| (*pid, name.clone()))
     }
 
     fn edit_filter(&mut self, key: KeyEvent) {
@@ -76,13 +87,21 @@ impl Picker {
         if count == 0 {
             return;
         }
-        let current = self.state.selected().unwrap_or(0) as isize;
-        self.state.select(Some((current + delta).clamp(0, count as isize - 1) as usize));
+        let current = self.state.selected().unwrap_or(0).cast_signed();
+        self.state.select(Some(
+            (current + delta)
+                .clamp(0, count.cast_signed() - 1)
+                .cast_unsigned(),
+        ));
     }
 
     fn clamp_selection(&mut self) {
         let count = self.visible().len();
-        let selected = self.state.selected().unwrap_or(0).min(count.saturating_sub(1));
+        let selected = self
+            .state
+            .selected()
+            .unwrap_or(0)
+            .min(count.saturating_sub(1));
         self.state.select((count > 0).then_some(selected));
     }
 }
@@ -128,5 +147,7 @@ fn list_processes() -> Vec<(u32, String)> {
 
 /// Process names are arbitrary bytes; control characters would corrupt the terminal.
 fn printable(name: &str) -> String {
-    name.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+    name.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }

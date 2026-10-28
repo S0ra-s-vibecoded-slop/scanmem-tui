@@ -32,8 +32,15 @@ impl Backend {
         let (tx, rx) = mpsc::channel();
         thread::Builder::new()
             .name("scanmem-reader".into())
-            .spawn(move || read_events(stdout, tx))?;
-        Ok((Backend { child, stdin, next_id: 1 }, rx))
+            .spawn(move || read_events(stdout, &tx))?;
+        Ok((
+            Backend {
+                child,
+                stdin,
+                next_id: 1,
+            },
+            rx,
+        ))
     }
 
     /// Send a batch of commands; the matching `Done` event carries its output.
@@ -100,12 +107,15 @@ fn spawn_with_merged_output(path: &str) -> io::Result<Child> {
         .spawn()
 }
 
-fn read_events(stdout: impl Read, tx: Sender<BackendEvent>) {
+fn read_events(stdout: impl Read, tx: &Sender<BackendEvent>) {
     let mut stream = BufReader::new(stdout);
     let mut batch: Vec<String> = Vec::new();
     while let Some(line) = read_line(&mut stream) {
         if let Some(id) = parse_sentinel(&line) {
-            let _ = tx.send(BackendEvent::Done { id, lines: std::mem::take(&mut batch) });
+            let _ = tx.send(BackendEvent::Done {
+                id,
+                lines: std::mem::take(&mut batch),
+            });
         } else if let Some((done, total)) = parse_progress(&line) {
             let _ = tx.send(BackendEvent::Progress { done, total });
         } else if !line.trim().is_empty() {

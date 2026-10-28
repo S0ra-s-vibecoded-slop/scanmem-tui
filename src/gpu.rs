@@ -22,7 +22,11 @@ pub struct GpuMeter {
 
 impl GpuMeter {
     pub fn detect() -> GpuMeter {
-        GpuMeter { nvml: Nvml::init().ok(), nvml_last_seen: HashMap::new(), drm_previous: None }
+        GpuMeter {
+            nvml: Nvml::init().ok(),
+            nvml_last_seen: HashMap::new(),
+            drm_previous: None,
+        }
     }
 
     /// Forgets everything remembered about the previous process.
@@ -44,20 +48,33 @@ impl GpuMeter {
         }
     }
 
+    #[expect(clippy::cast_precision_loss)]
     fn nvidia_percent(&mut self, pid: u32) -> Option<f32> {
         let nvml = self.nvml.as_ref()?;
         let count = nvml.device_count().ok()?;
         let mut busiest: Option<f32> = None;
         for index in 0..count {
-            let Ok(device) = nvml.device_by_index(index) else { continue };
-            let uses_device = device.running_graphics_processes().unwrap_or_default().iter().any(|p| p.pid == pid)
-                || device.running_compute_processes().unwrap_or_default().iter().any(|p| p.pid == pid);
+            let Ok(device) = nvml.device_by_index(index) else {
+                continue;
+            };
+            let uses_device = device
+                .running_graphics_processes()
+                .unwrap_or_default()
+                .iter()
+                .any(|p| p.pid == pid)
+                || device
+                    .running_compute_processes()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|p| p.pid == pid);
             if !uses_device {
                 continue;
             }
             let last_seen = self.nvml_last_seen.get(&index).copied();
             // Only samples newer than `last_seen` come back, so none means idle.
-            let Ok(samples) = device.process_utilization_stats(last_seen) else { continue };
+            let Ok(samples) = device.process_utilization_stats(last_seen) else {
+                continue;
+            };
             if let Some(newest) = samples.iter().map(|s| s.timestamp).max() {
                 self.nvml_last_seen.insert(index, newest);
             }
@@ -71,13 +88,20 @@ impl GpuMeter {
         busiest
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     fn drm_percent(&mut self, pid: u32) -> Option<f32> {
         let now = Instant::now();
         let engines = read_drm_engines(pid);
         let previous = std::mem::replace(&mut self.drm_previous, engines.clone().map(|e| (now, e)));
         let engines = engines?;
-        let Some((then, before)) = previous else { return Some(0.0) };
-        Some(busiest_engine_percent(&before, &engines, now.duration_since(then).as_nanos() as u64))
+        let Some((then, before)) = previous else {
+            return Some(0.0);
+        };
+        Some(busiest_engine_percent(
+            &before,
+            &engines,
+            now.duration_since(then).as_nanos() as u64,
+        ))
     }
 }
 
@@ -86,14 +110,19 @@ impl GpuMeter {
 fn read_drm_engines(pid: u32) -> Option<HashMap<String, u64>> {
     let mut clients = HashSet::new();
     let mut engines: HashMap<String, u64> = HashMap::new();
-    for entry in fs::read_dir(format!("/proc/{pid}/fdinfo")).ok()?.filter_map(Result::ok) {
-        let Ok(text) = fs::read_to_string(entry.path()) else { continue };
+    for entry in fs::read_dir(format!("/proc/{pid}/fdinfo"))
+        .ok()?
+        .filter_map(Result::ok)
+    {
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
         // A client shows up once per open fd (dup, fork); count it once.
-        if let Some((client, times)) = parse_drm_fdinfo(&text) {
-            if clients.insert(client) {
-                for (engine, ns) in times {
-                    *engines.entry(engine).or_insert(0) += ns;
-                }
+        if let Some((client, times)) = parse_drm_fdinfo(&text)
+            && clients.insert(client)
+        {
+            for (engine, ns) in times {
+                *engines.entry(engine).or_insert(0) += ns;
             }
         }
     }
@@ -106,7 +135,9 @@ fn parse_drm_fdinfo(text: &str) -> Option<(String, Vec<(String, u64)>)> {
     let (mut pdev, mut id) = (None, None);
     let mut engines = Vec::new();
     for line in text.lines() {
-        let Some((key, value)) = line.split_once(':') else { continue };
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
         let value = value.trim();
         match key {
             "drm-pdev" => pdev = Some(value),
@@ -114,7 +145,9 @@ fn parse_drm_fdinfo(text: &str) -> Option<(String, Vec<(String, u64)>)> {
             _ => {
                 if let Some(engine) = key.strip_prefix("drm-engine-") {
                     // Skip `drm-engine-capacity-<engine>`; only `<n> ns` lines count.
-                    let ns = value.strip_suffix("ns").and_then(|n| n.trim().parse::<u64>().ok());
+                    let ns = value
+                        .strip_suffix("ns")
+                        .and_then(|n| n.trim().parse::<u64>().ok());
                     if let (false, Some(ns)) = (engine.starts_with("capacity-"), ns) {
                         engines.push((engine.to_string(), ns));
                     }
@@ -129,7 +162,12 @@ fn parse_drm_fdinfo(text: &str) -> Option<(String, Vec<(String, u64)>)> {
 }
 
 /// Utilisation of the busiest engine over `elapsed_ns`, clamped to 0..=100.
-fn busiest_engine_percent(before: &HashMap<String, u64>, after: &HashMap<String, u64>, elapsed_ns: u64) -> f32 {
+#[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn busiest_engine_percent(
+    before: &HashMap<String, u64>,
+    after: &HashMap<String, u64>,
+    elapsed_ns: u64,
+) -> f32 {
     if elapsed_ns == 0 {
         return 0.0;
     }
@@ -137,7 +175,9 @@ fn busiest_engine_percent(before: &HashMap<String, u64>, after: &HashMap<String,
         .iter()
         .map(|(engine, &now)| now.saturating_sub(before.get(engine).copied().unwrap_or(now)))
         .max()
-        .map_or(0.0, |busy| (busy as f64 / elapsed_ns as f64 * 100.0).clamp(0.0, 100.0) as f32)
+        .map_or(0.0, |busy| {
+            (busy as f64 / elapsed_ns as f64 * 100.0).clamp(0.0, 100.0) as f32
+        })
 }
 
 #[cfg(test)]
@@ -152,7 +192,10 @@ mod tests {
     fn fdinfo_gives_client_and_engine_times() {
         let (client, engines) = parse_drm_fdinfo(AMDGPU).unwrap();
         assert_eq!(client, "0000:03:00.0/7");
-        assert_eq!(engines, vec![("gfx".to_string(), 1500), ("compute".to_string(), 20)]);
+        assert_eq!(
+            engines,
+            vec![("gfx".to_string(), 1500), ("compute".to_string(), 20)]
+        );
     }
 
     #[test]
@@ -166,7 +209,10 @@ mod tests {
     #[test]
     fn engine_percent_is_the_busiest_engines_share_of_the_interval() {
         let before = HashMap::from([("gfx".to_string(), 1_000), ("compute".to_string(), 0)]);
-        let after = HashMap::from([("gfx".to_string(), 251_000), ("compute".to_string(), 100_000)]);
+        let after = HashMap::from([
+            ("gfx".to_string(), 251_000),
+            ("compute".to_string(), 100_000),
+        ]);
         assert_eq!(busiest_engine_percent(&before, &after, 1_000_000), 25.0);
         assert_eq!(busiest_engine_percent(&before, &after, 0), 0.0);
         assert_eq!(busiest_engine_percent(&before, &after, 10), 100.0);
@@ -174,7 +220,11 @@ mod tests {
 
     #[test]
     fn a_process_without_any_source_has_no_reading() {
-        let mut meter = GpuMeter { nvml: None, nvml_last_seen: HashMap::new(), drm_previous: None };
+        let mut meter = GpuMeter {
+            nvml: None,
+            nvml_last_seen: HashMap::new(),
+            drm_previous: None,
+        };
         assert_eq!(meter.percent_of(u32::MAX), None);
     }
 }

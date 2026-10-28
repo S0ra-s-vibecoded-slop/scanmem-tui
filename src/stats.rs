@@ -27,7 +27,12 @@ pub struct Stats {
 
 impl Stats {
     pub fn new() -> Stats {
-        Stats { sys: System::new(), gpu: GpuMeter::detect(), pid: None, reading: Reading::default() }
+        Stats {
+            sys: System::new(),
+            gpu: GpuMeter::detect(),
+            pid: None,
+            reading: Reading::default(),
+        }
     }
 
     /// Switches to another process (or to none) and reads it straight away.
@@ -66,8 +71,11 @@ impl Stats {
         self.sys.refresh_cpu_usage();
         let sys_pid = Pid::from_u32(pid);
         // `true` drops the process from sysinfo once it has exited.
-        self.sys.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
-        let Some(process) = self.sys.process(sys_pid) else { return Reading::default() };
+        self.sys
+            .refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
+        let Some(process) = self.sys.process(sys_pid) else {
+            return Reading::default();
+        };
         Reading {
             cpu_percent: Some(process.cpu_usage()),
             gpu_percent: self.gpu.percent_of(pid),
@@ -77,14 +85,21 @@ impl Stats {
 }
 
 fn format_title(reading: Reading) -> String {
-    let cpu = reading.cpu_percent.map_or_else(|| "n/a".to_string(), |p| format!("{p:.0}%"));
-    let gpu = reading.gpu_percent.map_or_else(|| "n/a".to_string(), |p| format!("{p:.0}%"));
-    let mem = reading.mem_used.map_or_else(|| "n/a".to_string(), humanize_bytes);
+    let cpu = reading
+        .cpu_percent
+        .map_or_else(|| "n/a".to_string(), |p| format!("{p:.0}%"));
+    let gpu = reading
+        .gpu_percent
+        .map_or_else(|| "n/a".to_string(), |p| format!("{p:.0}%"));
+    let mem = reading
+        .mem_used
+        .map_or_else(|| "n/a".to_string(), humanize_bytes);
     format!("CPU: {cpu} GPU {gpu}, Memory: {mem}")
 }
 
 /// `10MiB` below 1 GiB, `2.1GiB` from 1 GiB up.
 fn humanize_bytes(bytes: u64) -> String {
+    #[expect(clippy::cast_precision_loss)]
     let b = bytes as f64;
     // 1023.6 MiB would round to "1024MiB"; promote it to GiB instead.
     if b >= GIB || (b / MIB).round() >= 1024.0 {
@@ -99,6 +114,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn humanize() {
         assert_eq!(humanize_bytes(0), "0MiB");
         assert_eq!(humanize_bytes(10 * 1024 * 1024), "10MiB");
@@ -112,15 +128,26 @@ mod tests {
 
     #[test]
     fn title_shows_the_process_reading() {
-        let reading = Reading { cpu_percent: Some(12.4), gpu_percent: Some(37.2), mem_used: Some(10 * 1024 * 1024) };
+        let reading = Reading {
+            cpu_percent: Some(12.4),
+            gpu_percent: Some(37.2),
+            mem_used: Some(10 * 1024 * 1024),
+        };
         assert_eq!(format_title(reading), "CPU: 12% GPU 37%, Memory: 10MiB");
     }
 
     #[test]
     fn title_says_n_a_instead_of_inventing_numbers() {
-        let reading = Reading { cpu_percent: Some(12.4), gpu_percent: None, mem_used: Some(10 * 1024 * 1024) };
+        let reading = Reading {
+            cpu_percent: Some(12.4),
+            gpu_percent: None,
+            mem_used: Some(10 * 1024 * 1024),
+        };
         assert_eq!(format_title(reading), "CPU: 12% GPU n/a, Memory: 10MiB");
-        assert_eq!(format_title(Reading::default()), "CPU: n/a GPU n/a, Memory: n/a");
+        assert_eq!(
+            format_title(Reading::default()),
+            "CPU: n/a GPU n/a, Memory: n/a"
+        );
     }
 
     #[test]

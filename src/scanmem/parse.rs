@@ -58,7 +58,12 @@ fn parse_match_line(line: &str) -> Option<Match> {
     let flags_at = tail.rfind(", [")?;
     let value = tail[..flags_at].trim().to_string();
     let flags = tail[flags_at + 3..].trim_end().trim_end_matches(']');
-    Some(Match { addr, region, value, types: distinct_types(flags) })
+    Some(Match {
+        addr,
+        region,
+        value,
+        types: distinct_types(flags),
+    })
 }
 
 fn distinct_types(flags: &str) -> Vec<DataType> {
@@ -113,7 +118,10 @@ mod tests {
         assert_eq!(strip_prompt("> > 01/06 searching"), "01/06 searching");
         assert_eq!(strip_prompt("12> 5> hi"), "hi");
         assert_eq!(strip_prompt("info: hello"), "info: hello");
-        assert_eq!(strip_prompt("[ 1] 7f, 5 + 1, heap, 3, [I8 ]"), "[ 1] 7f, 5 + 1, heap, 3, [I8 ]");
+        assert_eq!(
+            strip_prompt("[ 1] 7f, 5 + 1, heap, 3, [I8 ]"),
+            "[ 1] 7f, 5 + 1, heap, 3, [I8 ]"
+        );
         // progress lines start with digits but are not prompts
         assert_eq!(strip_prompt("01/06 searching"), "01/06 searching");
     }
@@ -129,13 +137,18 @@ mod tests {
 
     #[test]
     fn progress() {
-        assert_eq!(parse_progress("03/06 searching 0x1 - 0x2..........ok"), Some((3, 6)));
+        assert_eq!(
+            parse_progress("03/06 searching 0x1 - 0x2..........ok"),
+            Some((3, 6))
+        );
         assert_eq!(parse_progress("info: 6 suitable regions found."), None);
     }
 
     #[test]
+    #[expect(clippy::unreadable_literal)]
     fn match_line_int() {
-        let m = parse_match_line("[ 0] 559791c44010,  0 +         3010,   exe, 100, [I32 ]").unwrap();
+        let m =
+            parse_match_line("[ 0] 559791c44010,  0 +         3010,   exe, 100, [I32 ]").unwrap();
         assert_eq!(m.addr, 0x559791c44010);
         assert_eq!(m.region, "exe");
         assert_eq!(m.value, "100");
@@ -144,19 +157,26 @@ mod tests {
 
     #[test]
     fn match_line_float_and_multi_flags() {
-        let m = parse_match_line("[12] 7ffc8dc5328c,  5 +        1e28c, stack, 3.5, [F32 ]").unwrap();
+        let m =
+            parse_match_line("[12] 7ffc8dc5328c,  5 +        1e28c, stack, 3.5, [F32 ]").unwrap();
         assert_eq!(m.value, "3.5");
         assert_eq!(m.types, vec![DataType::F32]);
         let m = parse_match_line("[ 3] 1000,  1 + 10, heap, -7, [I64s I32s I16s I8s ]").unwrap();
         assert_eq!(m.value, "-7");
-        assert_eq!(m.types, vec![DataType::I64, DataType::I32, DataType::I16, DataType::I8]);
+        assert_eq!(
+            m.types,
+            vec![DataType::I64, DataType::I32, DataType::I16, DataType::I8]
+        );
     }
 
     #[test]
     fn non_match_lines() {
         assert!(parse_match_line("info: we currently have 3 matches.").is_none());
         assert!(parse_match_line("[ x] zz").is_none());
-        assert_eq!(parse_match_count("info: we currently have 3 matches."), Some(3));
+        assert_eq!(
+            parse_match_count("info: we currently have 3 matches."),
+            Some(3)
+        );
     }
 
     #[test]
@@ -169,7 +189,7 @@ mod tests {
             "error: bad value",
         ]
         .iter()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
         let parsed = parse_output(&lines);
         assert_eq!(parsed.count, Some(2));

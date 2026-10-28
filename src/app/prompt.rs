@@ -1,7 +1,7 @@
 //! The single-line text prompt: starting it, and acting on what was typed.
 
 use super::keys::edit_line;
-use super::{process_name, App, InputKind, Level, Mode};
+use super::{App, InputKind, Level, Mode, process_name};
 use crate::datatype::DataType;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
@@ -50,7 +50,9 @@ impl App {
             None => {}
             Some("exit" | "quit" | "q") => self.say(Level::Warn, "Use q in the main view to quit."),
             Some("pid") => self.attach_to_typed_pid(words.next()),
-            Some("option") if words.next() == Some("scan_data_type") => self.change_to_typed_type(words.next()),
+            Some("option") if words.next() == Some("scan_data_type") => {
+                self.change_to_typed_type(words.next());
+            }
             _ => self.start_scan(text),
         }
     }
@@ -89,7 +91,8 @@ fn parse_address(text: &str, default_type: DataType) -> Result<(u64, DataType), 
     let mut words = text.split_whitespace();
     let address = words.next().ok_or("empty address")?;
     let digits = address.trim_start_matches("0x").trim_start_matches("0X");
-    let addr = u64::from_str_radix(digits, 16).map_err(|_| format!("`{digits}` is not a hex address"))?;
+    let addr =
+        u64::from_str_radix(digits, 16).map_err(|_| format!("`{digits}` is not a hex address"))?;
     let ty = match words.next() {
         Some(name) => name.parse::<DataType>()?,
         None => default_type,
@@ -102,15 +105,30 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(clippy::unreadable_literal)]
     fn address_with_and_without_prefix_and_type() {
-        assert_eq!(parse_address("7ffc8dc5328c", DataType::I32), Ok((0x7ffc8dc5328c, DataType::I32)));
-        assert_eq!(parse_address("0xFF float64", DataType::I32), Ok((0xff, DataType::F64)));
+        assert_eq!(
+            parse_address("7ffc8dc5328c", DataType::I32),
+            Ok((0x7ffc8dc5328c, DataType::I32))
+        );
+        assert_eq!(
+            parse_address("0xFF float64", DataType::I32),
+            Ok((0xff, DataType::F64))
+        );
     }
 
     #[test]
     fn bad_addresses_explain_themselves() {
         assert!(parse_address("", DataType::I32).is_err());
-        assert!(parse_address("zz", DataType::I32).unwrap_err().contains("hex"));
-        assert!(parse_address("10 banana", DataType::I32).unwrap_err().contains("unknown type"));
+        assert!(
+            parse_address("zz", DataType::I32)
+                .unwrap_err()
+                .contains("hex")
+        );
+        assert!(
+            parse_address("10 banana", DataType::I32)
+                .unwrap_err()
+                .contains("unknown type")
+        );
     }
 }

@@ -1,4 +1,6 @@
 //! scanmem-tui: a terminal frontend for scanmem.
+#![warn(clippy::pedantic)]
+#![allow(clippy::enum_glob_use)]
 
 mod app;
 mod args;
@@ -11,12 +13,12 @@ mod scanmem;
 mod stats;
 mod ui;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use app::App;
 use args::Args;
 use clap::Parser;
-use ratatui::crossterm::event::{self, Event};
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::event::{self, Event};
 use std::io::ErrorKind;
 use std::process::Command;
 use std::time::Duration;
@@ -35,7 +37,9 @@ fn ensure_scanmem_installed(path: &str) -> Result<()> {
     match Command::new(path).arg("--version").output() {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            bail!("could not find `{path}`. Install scanmem, or point --scanmem (or $SCANMEM) at it.")
+            bail!(
+                "could not find `{path}`. Install scanmem, or point --scanmem (or $SCANMEM) at it."
+            )
         }
         Err(e) => bail!("could not run `{path}`: {e}"),
     }

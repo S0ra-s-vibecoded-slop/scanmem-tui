@@ -3,7 +3,7 @@
 use super::results::MAX_RESULTS;
 use super::{App, Level, Target};
 use crate::datatype::DataType;
-use crate::scanmem::{parse_output, Parsed};
+use crate::scanmem::{Parsed, parse_output};
 use std::time::Instant;
 
 enum JobKind {
@@ -12,7 +12,11 @@ enum JobKind {
     /// Switch the scan type (committed once scanmem accepts it).
     SetType(DataType),
     /// `pid N`, remembering the type that was selected at the time.
-    Attach { pid: u32, name: String, ty: DataType },
+    Attach {
+        pid: u32,
+        name: String,
+        ty: DataType,
+    },
 }
 
 /// The batch scanmem is currently working on.
@@ -28,19 +32,22 @@ impl App {
     pub(super) fn attach(&mut self, pid: u32, name: String) {
         let ty = self.scan_type;
         self.start_job(
-            vec![set_type_command(ty), format!("pid {pid}")],
+            &[set_type_command(ty), format!("pid {pid}")],
             JobKind::Attach { pid, name, ty },
             "Attaching",
         );
     }
 
     pub(super) fn change_type(&mut self, ty: DataType, label: &'static str) {
-        self.start_job(vec![set_type_command(ty)], JobKind::SetType(ty), label);
+        self.start_job(&[set_type_command(ty)], JobKind::SetType(ty), label);
     }
 
     pub(super) fn cycle_type(&mut self) {
         if !self.results.rows.is_empty() {
-            self.say(Level::Info, "Type changed; press n for a new scan if results look wrong.");
+            self.say(
+                Level::Info,
+                "Type changed; press n for a new scan if results look wrong.",
+            );
         }
         self.change_type(self.scan_type.next(), "Changing type");
     }
@@ -52,7 +59,7 @@ impl App {
         if self.is_busy() {
             return self.say(Level::Warn, "scanmem is busy");
         }
-        let commands = vec![command.to_string(), format!("list {MAX_RESULTS}")];
+        let commands = &[command.to_string(), format!("list {MAX_RESULTS}")];
         self.start_job(commands, JobKind::Scan, "Scanning");
     }
 
@@ -71,13 +78,13 @@ impl App {
         }
     }
 
-    pub(super) fn finish_job(&mut self, id: u64, lines: Vec<String>) {
+    pub(super) fn finish_job(&mut self, id: u64, lines: &[String]) {
         let Some(job) = self.job.take() else { return };
         if job.id != id {
             self.job = Some(job);
             return;
         }
-        let parsed = parse_output(&lines);
+        let parsed = parse_output(lines);
         let error = (!parsed.errors.is_empty()).then(|| parsed.errors.join("; "));
         let warning = parsed.warnings.first().cloned();
         match job.kind {
@@ -87,12 +94,20 @@ impl App {
         }
     }
 
-    fn start_job(&mut self, commands: Vec<String>, kind: JobKind, label: &'static str) {
+    fn start_job(&mut self, commands: &[String], kind: JobKind, label: &'static str) {
         if self.backend_dead {
             return self.say(Level::Error, "scanmem is not running (restart the program)");
         }
-        match self.backend.send(&commands) {
-            Ok(id) => self.job = Some(Job { id, kind, label, progress: None, since: Instant::now() }),
+        match self.backend.send(commands) {
+            Ok(id) => {
+                self.job = Some(Job {
+                    id,
+                    kind,
+                    label,
+                    progress: None,
+                    since: Instant::now(),
+                });
+            }
             Err(e) => {
                 self.backend_dead = true;
                 self.say(Level::Error, format!("lost connection to scanmem: {e}"));
@@ -111,7 +126,14 @@ impl App {
         }
     }
 
-    fn finish_attach(&mut self, pid: u32, name: String, ty: DataType, warning: Option<String>, error: Option<String>) {
+    fn finish_attach(
+        &mut self,
+        pid: u32,
+        name: String,
+        ty: DataType,
+        warning: Option<String>,
+        error: Option<String>,
+    ) {
         if let Some(error) = error {
             return self.say(Level::Error, format!("Could not attach to {pid}: {error}"));
         }
@@ -139,19 +161,26 @@ impl App {
         let (level, text) = match (target.memory().err(), warning) {
             (Some(reason), _) => (
                 Level::Warn,
-                format!("Attached to pid {}, but {reason} (try running as root)", target.pid),
+                format!(
+                    "Attached to pid {}, but {reason} (try running as root)",
+                    target.pid
+                ),
             ),
             (None, Some(warning)) => (Level::Warn, warning),
             (None, None) => (
                 Level::Ok,
-                format!("Attached to {} (pid {}). Press s to scan.", target.name, target.pid),
+                format!(
+                    "Attached to {} (pid {}). Press s to scan.",
+                    target.name, target.pid
+                ),
             ),
         };
         self.say(level, text);
     }
 
     fn apply_scan(&mut self, parsed: Parsed, error: Option<String>) {
-        self.results.replace(parsed.matches, parsed.count, self.scan_type);
+        self.results
+            .replace(parsed.matches, parsed.count, self.scan_type);
         self.refresh_live();
         self.report_scan(error);
     }
@@ -164,7 +193,12 @@ impl App {
         } else if total == 0 {
             self.say(Level::Warn, "No matches. Press n to start a new scan.");
         } else if self.results.is_truncated() {
-            self.say(Level::Ok, format!("{total} matches (showing the first {shown}). Narrow it down with another scan."));
+            self.say(
+                Level::Ok,
+                format!(
+                    "{total} matches (showing the first {shown}). Narrow it down with another scan."
+                ),
+            );
         } else {
             let noun = if total == 1 { "match" } else { "matches" };
             self.say(Level::Ok, format!("{total} {noun}"));

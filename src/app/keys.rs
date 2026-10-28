@@ -126,26 +126,44 @@ mod tests {
     #[test]
     fn typing_and_backspace() {
         let mut text = String::new();
-        assert!(edit_line(&mut text, press(KeyCode::Char('h'), KeyModifiers::NONE)));
-        assert!(edit_line(&mut text, press(KeyCode::Char('i'), KeyModifiers::SHIFT)));
+        assert!(edit_line(
+            &mut text,
+            press(KeyCode::Char('h'), KeyModifiers::NONE)
+        ));
+        assert!(edit_line(
+            &mut text,
+            press(KeyCode::Char('i'), KeyModifiers::SHIFT)
+        ));
         assert_eq!(text, "hi");
-        assert!(edit_line(&mut text, press(KeyCode::Backspace, KeyModifiers::NONE)));
+        assert!(edit_line(
+            &mut text,
+            press(KeyCode::Backspace, KeyModifiers::NONE)
+        ));
         assert_eq!(text, "h");
     }
 
     #[test]
     fn ctrl_u_clears_and_other_ctrl_chars_are_ignored() {
         let mut text = String::from("abc");
-        assert!(!edit_line(&mut text, press(KeyCode::Char('x'), KeyModifiers::CONTROL)));
+        assert!(!edit_line(
+            &mut text,
+            press(KeyCode::Char('x'), KeyModifiers::CONTROL)
+        ));
         assert_eq!(text, "abc");
-        assert!(edit_line(&mut text, press(KeyCode::Char('u'), KeyModifiers::CONTROL)));
-        assert!(text.is_empty());
+        assert!(edit_line(
+            &mut text,
+            press(KeyCode::Char('u'), KeyModifiers::CONTROL)
+        ));
+        assert_eq!(text, "");
     }
 
     #[test]
     fn non_text_keys_do_not_edit() {
         let mut text = String::from("abc");
-        assert!(!edit_line(&mut text, press(KeyCode::Left, KeyModifiers::NONE)));
+        assert!(!edit_line(
+            &mut text,
+            press(KeyCode::Left, KeyModifiers::NONE)
+        ));
         assert_eq!(text, "abc");
     }
 

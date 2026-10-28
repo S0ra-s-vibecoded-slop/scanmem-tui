@@ -33,7 +33,10 @@ pub enum Action {
 impl Action {
     /// Scanning commands are ignored while scanmem is still busy.
     pub fn needs_idle_backend(self) -> bool {
-        matches!(self, Action::PickProcess | Action::StartScan | Action::NewScan | Action::CycleType)
+        matches!(
+            self,
+            Action::PickProcess | Action::StartScan | Action::NewScan | Action::CycleType
+        )
     }
 }
 
@@ -47,7 +50,12 @@ enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 4] = [Section::Scanning, Section::Results, Section::Saved, Section::General];
+    const ALL: [Section; 4] = [
+        Section::Scanning,
+        Section::Results,
+        Section::Saved,
+        Section::General,
+    ];
 
     fn title(self) -> &'static str {
         match self {
@@ -205,8 +213,12 @@ pub fn help_text() -> String {
         }
         text.push_str(section.title());
         text.push('\n');
-        for binding in BINDINGS.iter().filter(|b| b.section == section && !b.help.is_empty()) {
-            text.push_str(&format!("  {:<12} {}\n", binding.label, binding.help));
+        for binding in BINDINGS
+            .iter()
+            .filter(|b| b.section == section && !b.help.is_empty())
+        {
+            use std::fmt::Write;
+            let _ = writeln!(text, "  {:<12} {}", binding.label, binding.help);
         }
     }
     text

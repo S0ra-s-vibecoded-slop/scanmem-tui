@@ -41,10 +41,15 @@ impl Freezer {
             let stop = Arc::clone(&stop);
             thread::Builder::new()
                 .name("freezer".into())
-                .spawn(move || run(shared, stop, interval))
+                .spawn(move || run(&shared, &stop, interval))
                 .expect("spawn freezer thread")
         };
-        Freezer { shared, stop, handle: Some(handle), interval }
+        Freezer {
+            shared,
+            stop,
+            handle: Some(handle),
+            interval,
+        }
     }
 
     pub fn set_pid(&self, pid: Option<u32>) {
@@ -66,11 +71,11 @@ impl Drop for Freezer {
     }
 }
 
-fn run(shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, interval: Duration) {
+fn run(shared: &Arc<Mutex<Shared>>, stop: &Arc<AtomicBool>, interval: Duration) {
     let mut open: Option<(u32, MemIo)> = None;
     while !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
-        let (pid, targets) = snapshot(&shared);
+        let (pid, targets) = snapshot(shared);
         let wanted_pid = if targets.is_empty() { None } else { pid };
         open = connection_for(open, wanted_pid);
         if let Some((_, mem)) = &open {

@@ -5,11 +5,11 @@ mod popups;
 
 use crate::app::{App, InputKind, Level, Mode};
 use crate::keymap;
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
-use ratatui::Frame;
 use std::time::Instant;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -28,7 +28,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(inner);
-    let [left, right] = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(main);
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(main);
 
     draw_header(f, app, header);
     panes::draw_results(f, app, left);
@@ -72,11 +73,17 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Target ", dim()),
         Span::styled(target, Style::new().bold()),
         Span::styled("  │  Type ", dim()),
-        Span::styled(app.scan_type.scanmem_name(), Style::new().bold().fg(Color::Cyan)),
+        Span::styled(
+            app.scan_type.scanmem_name(),
+            Style::new().bold().fg(Color::Cyan),
+        ),
         Span::styled("  │  Matches ", dim()),
         Span::styled(matches, Style::new().bold()),
         Span::styled("  │  Freeze every ", dim()),
-        Span::styled(format!("{}ms", app.freezer.interval.as_millis()), Style::new().bold()),
+        Span::styled(
+            format!("{}ms", app.freezer.interval.as_millis()),
+            Style::new().bold(),
+        ),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -88,19 +95,29 @@ fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+#[expect(clippy::cast_possible_truncation)]
 fn draw_prompt(f: &mut Frame, app: &App, kind: InputKind, area: Rect) {
     let block = framed(Color::Yellow, prompt_title(app, kind));
     let inner = block.inner(area);
-    f.render_widget(Paragraph::new(format!("› {}", app.input)).block(block), area);
+    f.render_widget(
+        Paragraph::new(format!("› {}", app.input)).block(block),
+        area,
+    );
     let x = inner.x + 2 + app.input.chars().count() as u16;
     f.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
 }
 
 fn prompt_title(app: &App, kind: InputKind) -> String {
     match kind {
-        InputKind::Scan => " Scan: value | > N | < N | = | != | + | - | snapshot | reset ".to_string(),
+        InputKind::Scan => {
+            " Scan: value | > N | < N | = | != | + | - | snapshot | reset ".to_string()
+        }
         InputKind::SetValue(index) => match app.saved.items.get(index) {
-            Some(saved) => format!(" Write {} value to 0x{:x} ", saved.ty.scanmem_name(), saved.addr),
+            Some(saved) => format!(
+                " Write {} value to 0x{:x} ",
+                saved.ty.scanmem_name(),
+                saved.addr
+            ),
             None => " Write value ".to_string(),
         },
         InputKind::Describe(_) => " Description ".to_string(),
@@ -111,9 +128,15 @@ fn prompt_title(app: &App, kind: InputKind) -> String {
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let line = match &app.job {
         Some(job) => spinner_line(job.label, job.progress, job.since),
-        None => Line::styled(app.status.text.clone(), Style::new().fg(level_color(app.status.level))),
+        None => Line::styled(
+            app.status.text.clone(),
+            Style::new().fg(level_color(app.status.level)),
+        ),
     };
-    f.render_widget(Paragraph::new(line).block(framed(Color::DarkGray, " Status ")), area);
+    f.render_widget(
+        Paragraph::new(line).block(framed(Color::DarkGray, " Status ")),
+        area,
+    );
 }
 
 fn spinner_line(label: &str, progress: Option<(u32, u32)>, since: Instant) -> Line<'static> {
@@ -123,7 +146,10 @@ fn spinner_line(label: &str, progress: Option<(u32, u32)>, since: Instant) -> Li
         None => String::new(),
     };
     Line::from(vec![
-        Span::styled(format!("{frame} {label}{progress}"), Style::new().fg(Color::Yellow)),
+        Span::styled(
+            format!("{frame} {label}{progress}"),
+            Style::new().fg(Color::Yellow),
+        ),
         Span::styled("   Esc to stop", dim()),
     ])
 }
@@ -144,5 +170,10 @@ fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
         Mode::Help => "any key to close".to_string(),
         Mode::Normal => keymap::hint_line(app.focus),
     };
-    f.render_widget(Paragraph::new(text).style(dim()).alignment(Alignment::Center), area);
+    f.render_widget(
+        Paragraph::new(text)
+            .style(dim())
+            .alignment(Alignment::Center),
+        area,
+    );
 }

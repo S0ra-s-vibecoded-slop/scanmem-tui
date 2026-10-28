@@ -139,7 +139,12 @@ impl App {
         self.job.is_some()
     }
 
-    fn new(backend: Backend, events: Receiver<BackendEvent>, freezer: Freezer, scan_type: DataType) -> App {
+    fn new(
+        backend: Backend,
+        events: Receiver<BackendEvent>,
+        freezer: Freezer,
+        scan_type: DataType,
+    ) -> App {
         App {
             backend,
             events,
@@ -155,7 +160,10 @@ impl App {
             focus: Focus::Results,
             mode: Mode::Normal,
             input: String::new(),
-            status: Status { text: "Starting scanmem…".into(), level: Level::Info },
+            status: Status {
+                text: "Starting scanmem…".into(),
+                level: Level::Info,
+            },
             should_quit: false,
             redraw: true,
             last_live: Instant::now(),
@@ -164,17 +172,19 @@ impl App {
     }
 
     fn begin_session(&mut self, initial_pid: Option<u32>) {
-        match initial_pid {
-            Some(pid) => self.attach(pid, process_name(pid)),
-            None => {
-                self.change_type(self.scan_type, "Starting scanmem");
-                self.open_picker();
-            }
+        if let Some(pid) = initial_pid {
+            self.attach(pid, process_name(pid));
+        } else {
+            self.change_type(self.scan_type, "Starting scanmem");
+            self.open_picker();
         }
     }
 
     fn say(&mut self, level: Level, text: impl Into<String>) {
-        self.status = Status { text: text.into(), level };
+        self.status = Status {
+            text: text.into(),
+            level,
+        };
         self.redraw = true;
     }
 
@@ -195,7 +205,7 @@ impl App {
         self.redraw = true;
         match event {
             BackendEvent::Progress { done, total } => self.record_progress(done, total),
-            BackendEvent::Done { id, lines } => self.finish_job(id, lines),
+            BackendEvent::Done { id, lines } => self.finish_job(id, &lines),
             BackendEvent::Exited(lines) => self.on_backend_exited(&lines),
         }
     }
@@ -240,8 +250,7 @@ impl App {
 
 fn process_name(pid: u32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|name| name.trim().to_string())
-        .unwrap_or_else(|_| format!("pid {pid}"))
+        .map_or_else(|_| format!("pid {pid}"), |name| name.trim().to_string())
 }
 
 /// Moves a table selection by `delta` rows, clamped to the table.
@@ -250,7 +259,9 @@ fn move_table_selection(state: &mut TableState, len: usize, delta: isize) {
         state.select(None);
         return;
     }
-    let current = state.selected().unwrap_or(0) as isize;
-    let next = current.saturating_add(delta).clamp(0, len as isize - 1);
-    state.select(Some(next as usize));
+    let current = state.selected().unwrap_or(0).cast_signed();
+    let next = current
+        .saturating_add(delta)
+        .clamp(0, len.cast_signed() - 1);
+    state.select(Some(next.cast_unsigned()));
 }

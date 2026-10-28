@@ -2,11 +2,11 @@
 
 use super::{dim, framed};
 use crate::app::{App, Focus, ResultRow, Saved};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, Wrap};
-use ratatui::Frame;
 
 const RESULTS_NEED_PROCESS: &str = "Press p to pick a process.";
 const RESULTS_EMPTY: &str = "No results.\n\nPress s and type a value (e.g. 100),\nor `snapshot` to start without one.\nThen narrow down with: value, > N, < N,\n=, !=, +, -";
@@ -14,20 +14,34 @@ const SAVED_EMPTY: &str = "Empty.\n\nSelect a scan result and press a (or Enter)
 
 pub fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Results;
-    let block = pane_block(format!(" Scan results ({}) ", app.results.rows.len()), focused);
+    let block = pane_block(
+        format!(" Scan results ({}) ", app.results.rows.len()),
+        focused,
+    );
     app.results.viewport = block.inner(area).height.saturating_sub(1) as usize;
 
     if app.results.rows.is_empty() {
-        let message = if app.target.is_none() { RESULTS_NEED_PROCESS } else { RESULTS_EMPTY };
+        let message = if app.target.is_none() {
+            RESULTS_NEED_PROCESS
+        } else {
+            RESULTS_EMPTY
+        };
         return draw_placeholder(f, block, area, message);
     }
 
     let rows = app.results.rows.iter().map(result_row);
-    let table = Table::new(rows, [Constraint::Length(16), Constraint::Min(8), Constraint::Length(7)])
-        .header(header_row(["Address", "Value", "Region"]))
-        .block(block)
-        .row_highlight_style(highlight(focused))
-        .highlight_symbol("▶ ");
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(16),
+            Constraint::Min(8),
+            Constraint::Length(7),
+        ],
+    )
+    .header(header_row(["Address", "Value", "Region"]))
+    .block(block)
+    .row_highlight_style(highlight(focused))
+    .highlight_symbol("▶ ");
     f.render_stateful_widget(table, area, &mut app.results.state);
 }
 
@@ -66,7 +80,11 @@ fn saved_title(app: &App) -> String {
 fn result_row(row: &ResultRow) -> Row<'static> {
     let shown = row.live.as_deref().unwrap_or(&row.m.value);
     let changed = row.live.as_deref().is_some_and(|live| live != row.m.value);
-    let value_style = if changed { Style::new().fg(Color::Yellow) } else { Style::new() };
+    let value_style = if changed {
+        Style::new().fg(Color::Yellow)
+    } else {
+        Style::new()
+    };
     Row::new([
         Cell::from(format!("0x{:x}", row.m.addr)),
         Cell::from(shown.to_string()).style(value_style),
@@ -80,8 +98,16 @@ fn saved_row(saved: &Saved) -> Row<'static> {
         (Some(_), false) => "[ ]",
         (Some(_), true) => "[x]",
     };
-    let row_style = if saved.frozen { Style::new().fg(Color::Green) } else { Style::new() };
-    let description = if saved.desc.is_empty() { "—".to_string() } else { saved.desc.clone() };
+    let row_style = if saved.frozen {
+        Style::new().fg(Color::Green)
+    } else {
+        Style::new()
+    };
+    let description = if saved.desc.is_empty() {
+        "—".to_string()
+    } else {
+        saved.desc.clone()
+    };
     Row::new([
         Cell::from(checkbox),
         Cell::from(description),
@@ -97,7 +123,11 @@ fn header_row<const N: usize>(titles: [&'static str; N]) -> Row<'static> {
 }
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
-    let (color, weight) = if focused { (Color::Cyan, Style::new().bold()) } else { (Color::DarkGray, Style::new()) };
+    let (color, weight) = if focused {
+        (Color::Cyan, Style::new().bold())
+    } else {
+        (Color::DarkGray, Style::new())
+    };
     framed(color, Line::from(title).style(weight))
 }
 
@@ -112,5 +142,10 @@ fn highlight(focused: bool) -> Style {
 fn draw_placeholder(f: &mut Frame, block: Block<'_>, area: Rect, message: &str) {
     let inner = block.inner(area);
     f.render_widget(block, area);
-    f.render_widget(Paragraph::new(message).style(dim()).wrap(Wrap { trim: false }), inner);
+    f.render_widget(
+        Paragraph::new(message)
+            .style(dim())
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
