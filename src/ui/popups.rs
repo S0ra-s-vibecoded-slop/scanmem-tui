@@ -1,0 +1,51 @@
+//! The process picker and the help screen.
+
+use super::framed;
+use crate::app::{App, Mode};
+use crate::keymap;
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Clear, List, ListItem, Paragraph};
+use ratatui::Frame;
+
+pub fn draw(f: &mut Frame, app: &mut App) {
+    match app.mode {
+        Mode::Picker => draw_picker(f, app),
+        Mode::Help => draw_help(f),
+        Mode::Normal | Mode::Input(_) => {}
+    }
+}
+
+fn draw_picker(f: &mut Frame, app: &mut App) {
+    let area = centered(f.area(), 60, 70);
+    f.render_widget(Clear, area);
+    let block = framed(Color::Cyan, " Select process ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [filter, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    f.render_widget(Paragraph::new(format!("filter › {}", app.picker.filter)), filter);
+    f.set_cursor_position((filter.x + 9 + app.picker.filter.chars().count() as u16, filter.y));
+
+    let items: Vec<ListItem> = app
+        .picker
+        .visible()
+        .iter()
+        .map(|(pid, name)| ListItem::new(format!("{pid:>8}  {name}")))
+        .collect();
+    let widget = List::new(items)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(widget, list, &mut app.picker.state);
+}
+
+fn draw_help(f: &mut Frame) {
+    let area = centered(f.area(), 70, 85);
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(keymap::help_text()).block(framed(Color::Cyan, " Help ")), area);
+}
+
+fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let [row] = Layout::vertical([Constraint::Percentage(percent_y)]).flex(Flex::Center).areas(area);
+    let [cell] = Layout::horizontal([Constraint::Percentage(percent_x)]).flex(Flex::Center).areas(row);
+    cell
+}
