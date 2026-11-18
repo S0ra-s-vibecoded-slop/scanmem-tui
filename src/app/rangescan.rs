@@ -9,8 +9,43 @@
 use super::results::MAX_RESULTS;
 use super::{App, Level};
 use crate::datatype::DataType;
+use crate::memio::MemIo;
 use crate::scanmem::Match;
-use crate::scanner::{self, Operand, ScanStep};
+use crate::scanner::{self, Candidate, Operand, ScanControl, ScanStep};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::thread;
+use std::time::Instant;
+
+/// A range scan running on its own thread, with its results on the way back.
+pub(crate) struct RangeJob {
+    pub control: Arc<ScanControl>,
+    rx: Receiver<RangeOutcome>,
+    /// What the scanner took over; restored if the scan stops or fails, so a
+    /// narrowed list is not lost to a cancel.
+    previous: Option<Vec<Candidate>>,
+    pub label: &'static str,
+    pub since: Instant,
+}
+
+impl RangeJob {
+    /// Progress as a percentage, when the total is known.
+    pub fn percent(&self) -> Option<u64> {
+        let (done, total) = self.control.progress();
+        (total > 0).then(|| (done * 100 / total).min(100))
+    }
+}
+
+enum RangeOutcome {
+    Swept {
+        candidates: Vec<Candidate>,
+        total: u64,
+    },
+    Narrowed {
+        survivors: Vec<Candidate>,
+    },
+    Failed(String),
+}
 
 impl App {
     /// `range <label|address> <offset>`: limit later scans to `base ± offset`.
@@ -56,7 +91,8 @@ impl App {
             .or_else(|| parse_hex_address(word))
     }
 
-    /// A scan command while a range is active: runs on the built-in scanner.
+    /// A scan command while a range is active: hands it to the built-in
+    /// scanner on a background thread, so the UI stays responsive.
     pub(super) fn start_range_scan(&mut self, text: &str) {
         if !self.require_target() {
             return;
@@ -72,29 +108,111 @@ impl App {
             Ok(step) => step,
             Err(reason) => return self.say(Level::Error, reason),
         };
-        let Some(memory) = self.target.as_ref().and_then(|t| t.memory().ok()) else {
-            return self.say(
-                Level::Error,
-                "cannot read process memory (try running as root)",
-            );
-        };
-
-        let (candidates, total) = if self.candidates.is_empty() && step.takes_a_value() {
-            scanner::scan_range(memory, lo, hi, ty, step)
-        } else if !self.candidates.is_empty() {
-            let taken = std::mem::take(&mut self.candidates);
-            let survivors = scanner::narrow(memory, ty, step, taken);
-            let total = survivors.len() as u64;
-            (survivors, total)
-        } else {
+        let pid = self
+            .target
+            .as_ref()
+            .map(|target| target.pid)
+            .unwrap_or_default();
+        let first = self.candidates.is_empty();
+        if first && !step.takes_a_value() {
             return self.say(
                 Level::Error,
                 "cannot use that search without matches; scan a value inside the range first",
             );
+        }
+
+        let control = Arc::new(ScanControl::new());
+        let (tx, rx) = channel();
+        // Narrowing reads the previous candidates on the scan thread; the
+        // App keeps a copy to restore if the scan stops or fails.
+        let previous = if first {
+            None
+        } else {
+            Some(std::mem::take(&mut self.candidates))
         };
-        self.candidates = candidates;
-        self.show_candidates(total);
-        self.report_scan(None);
+        let thread_previous = previous.clone().map(Arc::new);
+        let thread_control = control.clone();
+        let label = if first { "Scanning range" } else { "Narrowing" };
+        let spawned = thread::Builder::new()
+            .name("range-scan".into())
+            .spawn(move || {
+                let request = RangeScan {
+                    pid,
+                    lo,
+                    hi,
+                    ty,
+                    step,
+                    first,
+                };
+                run_range_scan(
+                    &request,
+                    thread_previous.as_deref().map(Vec::as_slice),
+                    &thread_control,
+                    &tx,
+                );
+            });
+        match spawned {
+            Ok(spawned) => spawned,
+            Err(reason) => {
+                if let Some(previous) = previous {
+                    self.candidates = previous;
+                }
+                return self.say(Level::Error, format!("could not start the scan: {reason}"));
+            }
+        };
+        self.range_job = Some(RangeJob {
+            control,
+            rx,
+            previous,
+            label,
+            since: Instant::now(),
+        });
+        self.say(Level::Info, format!("{label} 0x{lo:x} - 0x{hi:x}…"));
+    }
+
+    /// Picks up a finished range scan, if its thread has delivered one.
+    pub(super) fn drain_range_job(&mut self) {
+        let outcome = match &self.range_job {
+            None => return,
+            Some(job) => match job.rx.try_recv() {
+                Ok(outcome) => outcome,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    // The thread is gone without a result; treat as stopped.
+                    self.range_job = None;
+                    return;
+                }
+            },
+        };
+        let Some(job) = self.range_job.take() else {
+            return;
+        };
+        self.redraw = true;
+        if job.control.cancelled() {
+            if let Some(previous) = job.previous {
+                self.candidates = previous;
+            }
+            return self.say(Level::Warn, "Range scan stopped.");
+        }
+        match outcome {
+            RangeOutcome::Swept { candidates, total } => {
+                self.candidates = candidates;
+                self.show_candidates(total);
+                self.report_scan(None);
+            }
+            RangeOutcome::Narrowed { survivors } => {
+                let total = survivors.len() as u64;
+                self.candidates = survivors;
+                self.show_candidates(total);
+                self.report_scan(None);
+            }
+            RangeOutcome::Failed(reason) => {
+                if let Some(previous) = job.previous {
+                    self.candidates = previous;
+                }
+                self.say(Level::Error, reason);
+            }
+        }
     }
 
     /// Mirrors the candidate list into the results table, capped like
@@ -114,6 +232,49 @@ impl App {
             .collect();
         self.results.replace(matches, Some(total), ty);
     }
+}
+
+/// Everything one range scan needs, owned by the scan thread.
+struct RangeScan {
+    pid: u32,
+    lo: u64,
+    hi: u64,
+    ty: DataType,
+    step: ScanStep,
+    first: bool,
+}
+
+/// The scan thread's body: opens its own memory handle and reports the
+/// result (or the reason there is none) back to the App.
+fn run_range_scan(
+    request: &RangeScan,
+    previous: Option<&[Candidate]>,
+    control: &ScanControl,
+    tx: &Sender<RangeOutcome>,
+) {
+    let RangeScan {
+        pid,
+        lo,
+        hi,
+        ty,
+        step,
+        first,
+    } = *request;
+    let _ = tx.send(match MemIo::open(pid) {
+        Err(reason) => RangeOutcome::Failed(format!(
+            "cannot open /proc/{pid}/mem: {reason} (try running as root)"
+        )),
+        Ok(memory) if first => {
+            let spans = scanner::clipped_spans(pid, lo, hi);
+            let (candidates, total) = scanner::sweep(&memory, &spans, ty, step, control);
+            RangeOutcome::Swept { candidates, total }
+        }
+        Ok(memory) => {
+            let previous = previous.expect("narrowing always has previous candidates");
+            let survivors = scanner::narrow(&memory, ty, step, previous, control);
+            RangeOutcome::Narrowed { survivors }
+        }
+    });
 }
 
 /// `range` offsets: `0x10000` is hex, anything else is decimal.

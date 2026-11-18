@@ -86,6 +86,11 @@ impl App {
     }
 
     fn stop_scan(&mut self) {
+        if let Some(job) = &self.range_job {
+            job.control.cancel();
+            self.say(Level::Info, "Stopping range scan…");
+            return;
+        }
         if self.is_busy() {
             self.backend.interrupt();
             self.say(Level::Info, "Stopping scan…");

@@ -23,16 +23,123 @@
 
 use crate::datatype::DataType;
 use crate::memio::MemIo;
+use rayon::prelude::*;
 use std::cmp::Ordering;
+use std::fs;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 /// How many matches a range scan stores before it stops storing (but keeps
 /// counting) so the caller can report a truncated result.
 pub const MAX_MATCHES: usize = 1_000_000;
 
-/// Bytes fetched per read while sweeping the range; unreadable spans are
-/// retried page by page, so holes between mappings are skipped.
+/// Bytes fetched per read while sweeping; unreadable spans are retried page
+/// by page, so holes between mappings are skipped.
 const CHUNK: usize = 64 * 1024;
 const PAGE: u64 = 4096;
+/// Address range one parallel sweep task covers.
+const SWEEP_CHUNK: u64 = 8 * 1024 * 1024;
+
+/// Shared between the UI thread and the scan thread: asks the scan to stop
+/// and reports how far it has got. `total == 0` means unknown.
+#[derive(Default)]
+pub struct ScanControl {
+    cancel: AtomicBool,
+    done: AtomicU64,
+    total: AtomicU64,
+}
+
+impl ScanControl {
+    pub fn new() -> ScanControl {
+        ScanControl::default()
+    }
+
+    /// Ask the running scan to stop at its next check.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Relaxed);
+    }
+
+    /// Whether a stop was requested.
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Relaxed)
+    }
+
+    pub fn set_total(&self, total: u64) {
+        self.total.store(total, Relaxed);
+    }
+
+    /// How much work is finished, and how much there is in total.
+    pub fn progress(&self) -> (u64, u64) {
+        (self.done.load(Relaxed), self.total.load(Relaxed))
+    }
+
+    fn add_done(&self, bytes: u64) {
+        self.done.fetch_add(bytes, Relaxed);
+    }
+}
+
+/// One contiguous readable span of the target's address space, already
+/// clipped to the scan range. Adjacent mappings are merged, so bytes inside a
+/// span can be read without a gap interrupting them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub start: u64,
+    /// Exclusive end of the matchable addresses.
+    pub end: u64,
+    /// True when `end` is the scan limit rather than the real end of the
+    /// mapping: a value starting just below it reaches past `end`.
+    pub padded: bool,
+}
+
+/// Every readable span of `pid` that intersects `[lo, hi]`. Falls back to one
+/// pseudo-span covering the raw range when the maps file cannot be read, so
+/// scanning then crawls page by page exactly like scanmem does.
+pub fn clipped_spans(pid: u32, lo: u64, hi: u64) -> Vec<Span> {
+    match fs::read_to_string(format!("/proc/{pid}/maps")) {
+        Ok(text) => spans_from_maps(&text, lo, hi),
+        Err(_) => vec![Span {
+            start: lo,
+            end: hi.saturating_add(1),
+            padded: true,
+        }],
+    }
+}
+
+/// Turns `/proc/<pid>/maps` text into spans clipped to `[lo, hi]`. All
+/// mappings count (unreadable pages are skipped at scan time), and mappings
+/// that touch are merged so values straddling them are still matched.
+fn spans_from_maps(text: &str, lo: u64, hi: u64) -> Vec<Span> {
+    let limit = hi.saturating_add(1);
+    let mut spans: Vec<Span> = Vec::new();
+    for line in text.lines() {
+        let Some((range, _)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some((start_text, end_text)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            u64::from_str_radix(start_text, 16),
+            u64::from_str_radix(end_text, 16),
+        ) else {
+            continue;
+        };
+        let (start, end) = (start.max(lo), end.min(limit));
+        if start >= end {
+            continue;
+        }
+        let padded = end == limit;
+        match spans.last_mut() {
+            // Touching mappings merge; the merged span reaches the clip only
+            // if its last constituent does.
+            Some(last) if last.end == start => {
+                last.end = end;
+                last.padded = padded;
+            }
+            _ => spans.push(Span { start, end, padded }),
+        }
+    }
+    spans
+}
 
 /// One scan step, in the same syntax scanmem's prompt takes.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -146,20 +253,111 @@ impl ReadMemory for MemIo {
     }
 }
 
-/// First search over `[lo, hi]`: every address whose `ty`-sized value
-/// matches `step` (which must take a value). Both bounds are inclusive.
-/// Matches are stored up to [`MAX_MATCHES`], but everything is counted.
-/// Returns the candidates and the total number of matches.
-pub fn scan_range(
-    reader: &impl ReadMemory,
-    lo: u64,
-    hi: u64,
+/// First search over every span: every address whose `ty`-sized value
+/// matches `step` (which must take a value). Matches are stored up to
+/// [`MAX_MATCHES`], but everything is counted. Returns the candidates and
+/// the total number of matches. Progress goes to `control`, which also
+/// stops the sweep when [`ScanControl::cancel`] was called.
+pub fn sweep<R: ReadMemory + Sync>(
+    reader: &R,
+    spans: &[Span],
     ty: DataType,
     step: ScanStep,
+    control: &ScanControl,
+) -> (Vec<Candidate>, u64) {
+    // Done counts every fetched byte, including page-granular retries in
+    // unreadable spans, so this is an approximation — close enough for a
+    // percentage.
+    control.set_total(spans.iter().map(|span| span.end - span.start).sum());
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut total: u64 = 0;
+    for span in spans {
+        if control.cancelled() {
+            break;
+        }
+        let (span_candidates, span_total) =
+            sweep_span(reader, span, ty, step, control, SWEEP_CHUNK);
+        total += span_total;
+        candidates.extend(span_candidates);
+    }
+    candidates.truncate(MAX_MATCHES);
+    (candidates, total)
+}
+
+/// Sweeps one span, split into page-aligned chunks scanned in parallel. The
+/// chunks cover the span in address order, so the collected results stay
+/// ascending.
+fn sweep_span<R: ReadMemory + Sync>(
+    reader: &R,
+    span: &Span,
+    ty: DataType,
+    step: ScanStep,
+    control: &ScanControl,
+    chunk: u64,
+) -> (Vec<Candidate>, u64) {
+    let width = ty.size() as u64;
+    let starts = chunk_starts(span.start, span.end, chunk);
+    let chunks: Vec<(u64, u64, u64)> = starts
+        .iter()
+        .enumerate()
+        .map(|(i, &lo)| {
+            let hi = starts.get(i + 1).copied().unwrap_or(span.end);
+            // A chunk's last owned value reaches `width - 1` bytes past its
+            // end, into the next chunk's territory; at the span's end only a
+            // clipped (not real) end is padded.
+            let read_hi = if i + 1 < starts.len() {
+                hi + width - 1
+            } else {
+                hi + if span.padded { width - 1 } else { 0 }
+            };
+            (lo, hi, read_hi)
+        })
+        .collect();
+    let results: Vec<(Vec<Candidate>, u64)> = chunks
+        .par_iter()
+        .map(|&(lo, hi, read_hi)| scan_region(reader, lo, hi, read_hi, ty, step, control))
+        .collect();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut total: u64 = 0;
+    for (chunk_candidates, chunk_total) in results {
+        candidates.extend(chunk_candidates);
+        total += chunk_total;
+    }
+    (candidates, total)
+}
+
+/// Start addresses of the chunks covering `[start, end)`: the first chunk
+/// begins at `start`, later boundaries are page-aligned.
+fn chunk_starts(start: u64, end: u64, chunk: u64) -> Vec<u64> {
+    let mut starts = vec![start];
+    let mut next = start.saturating_add(chunk);
+    while next < end {
+        let Some(ceiling) = next.checked_add(PAGE - 1) else {
+            break;
+        };
+        let aligned = ceiling / PAGE * PAGE;
+        if aligned >= end {
+            break;
+        }
+        starts.push(aligned);
+        next = aligned.saturating_add(chunk);
+    }
+    starts
+}
+
+/// Scans the byte range `[lo, read_hi)` of one chunk, comparing values that
+/// start inside `[lo, hi)`. Bytes past `hi` only serve as tails of values
+/// starting before it, so nothing is compared twice across chunks.
+fn scan_region<R: ReadMemory>(
+    reader: &R,
+    lo: u64,
+    hi: u64,
+    read_hi: u64,
+    ty: DataType,
+    step: ScanStep,
+    control: &ScanControl,
 ) -> (Vec<Candidate>, u64) {
     let width = ty.size();
-    // A value at `hi` spans past it, so read a type's worth further.
-    let last_byte = hi.saturating_add(width as u64 - 1);
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut total: u64 = 0;
 
@@ -171,11 +369,11 @@ pub fn scan_range(
     let mut buf = vec![0u8; CHUNK];
 
     let mut addr = lo;
-    // Values starting at `hi` reach `width - 1` bytes past it, so read on
-    // until `last_byte`; every position that gets compared here is at most
-    // `hi`, because reads are capped at `last_byte`.
-    while addr <= last_byte {
-        let mut want = CHUNK.min((last_byte - addr + 1) as usize);
+    while addr < read_hi && pending_addr < hi {
+        if control.cancelled() {
+            break;
+        }
+        let mut want = CHUNK.min((read_hi - addr) as usize);
         let mut got = reader.read(addr, &mut buf[..want]);
         if got < width {
             // The read failed: either `addr` sits in an unreadable span or the
@@ -187,25 +385,29 @@ pub fn scan_range(
                 // Unreadable page: a value cannot combine across it, so drop
                 // anything pending and continue at the next page.
                 pending.clear();
-                addr = ((addr | (PAGE - 1)) + 1).min(last_byte + 1);
+                control.add_done(PAGE);
+                addr = ((addr | (PAGE - 1)) + 1).min(read_hi);
                 pending_addr = addr;
                 continue;
             }
         }
+        control.add_done(got as u64);
         pending.extend_from_slice(&buf[..got]);
 
         let comparable = pending.len() - (width - 1);
         for p in 0..comparable {
+            let at = pending_addr + p as u64;
+            if at >= hi {
+                break; // the next chunk owns this one
+            }
             let current = &pending[p..p + width];
             if let Some(interp) = step_matches(step, ty, current, None, None) {
                 total += 1;
-                if candidates.len() < MAX_MATCHES {
-                    candidates.push(Candidate {
-                        addr: pending_addr + p as u64,
-                        old: current.to_vec(),
-                        interp,
-                    });
-                }
+                candidates.push(Candidate {
+                    addr: at,
+                    old: current.to_vec(),
+                    interp,
+                });
             }
         }
         // Keep the last `width - 1` bytes so values straddling the next read
@@ -217,43 +419,52 @@ pub fn scan_range(
     (candidates, total)
 }
 
-/// Narrows `candidates` to those whose current value still matches `step`.
-/// Candidates whose memory became unreadable are dropped, like scanmem's
-/// failed peeks. `Update` keeps everything but refreshes the old bytes.
-pub fn narrow(
-    reader: &impl ReadMemory,
+/// Narrows `candidates` to those whose current value still matches `step`,
+/// reading each address in parallel. Candidates whose memory became
+/// unreadable are dropped, like scanmem's failed peeks. `Update` keeps
+/// everything but refreshes the old bytes. Progress and cancellation go
+/// through `control`.
+pub fn narrow<R: ReadMemory + Sync>(
+    reader: &R,
     ty: DataType,
     step: ScanStep,
-    candidates: Vec<Candidate>,
+    candidates: &[Candidate],
+    control: &ScanControl,
 ) -> Vec<Candidate> {
     let width = ty.size();
-    let mut buf = vec![0u8; width];
-    let mut survivors = Vec::new();
-    for candidate in candidates {
-        if reader.read(candidate.addr, &mut buf) < width {
-            continue;
-        }
-        let current = buf[..width].to_vec();
-        let interp = match step {
-            ScanStep::Update => candidate.interp,
-            _ => match step_matches(
-                step,
-                ty,
-                &current,
-                Some(&candidate.old),
-                Some(candidate.interp),
-            ) {
-                Some(interp) => interp,
-                None => continue,
+    control.set_total(candidates.len() as u64);
+    candidates
+        .par_iter()
+        .map_init(
+            || vec![0u8; width],
+            |buf, candidate| {
+                if control.cancelled() {
+                    return None;
+                }
+                control.add_done(1);
+                if reader.read(candidate.addr, buf) < width {
+                    return None;
+                }
+                let current = buf[..width].to_vec();
+                let interp = match step {
+                    ScanStep::Update => candidate.interp,
+                    _ => step_matches(
+                        step,
+                        ty,
+                        &current,
+                        Some(&candidate.old),
+                        Some(candidate.interp),
+                    )?,
+                };
+                Some(Candidate {
+                    addr: candidate.addr,
+                    old: current,
+                    interp,
+                })
             },
-        };
-        survivors.push(Candidate {
-            addr: candidate.addr,
-            old: current,
-            interp,
-        });
-    }
-    survivors
+        )
+        .filter_map(std::convert::identity)
+        .collect()
 }
 
 /// Whether the bytes read at an address match `step`. `old` and `old_interp`
@@ -569,6 +780,28 @@ mod tests {
         Operand::Int(value)
     }
 
+    /// Sweeps one pseudo-span over `[lo, hi]`, like a scan without maps.
+    fn sweep_range(
+        mem: &FakeMemory,
+        lo: u64,
+        hi: u64,
+        ty: DataType,
+        step: ScanStep,
+    ) -> (Vec<Candidate>, u64) {
+        let control = ScanControl::new();
+        sweep(
+            mem,
+            &[Span {
+                start: lo,
+                end: hi + 1,
+                padded: true,
+            }],
+            ty,
+            step,
+            &control,
+        )
+    }
+
     fn step_of(step: ScanStep, ty: DataType, bytes: &[u8], old: Option<&[u8]>) -> Option<Interp> {
         step_matches(step, ty, bytes, old, old.map(|_| Interp::Both))
     }
@@ -801,7 +1034,7 @@ mod tests {
                 0, 50, 0, 0, // 0x100c..: not 50 anywhere in range
             ],
         );
-        let (candidates, total) = scan_range(
+        let (candidates, total) = sweep_range(
             &mem,
             0x1000,
             0x100d,
@@ -826,7 +1059,13 @@ mod tests {
             old: 10i32.to_le_bytes().to_vec(),
             interp: Interp::Both,
         }];
-        let survivors = narrow(&mem, DataType::I32, ScanStep::Increased, candidates);
+        let survivors = narrow(
+            &mem,
+            DataType::I32,
+            ScanStep::Increased,
+            &candidates,
+            &ScanControl::new(),
+        );
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0].old, 11i32.to_le_bytes());
 
@@ -836,7 +1075,13 @@ mod tests {
             old: 10i32.to_le_bytes().to_vec(),
             interp: Interp::Both,
         }];
-        let survivors = narrow(&mem, DataType::I32, ScanStep::Equal(int(10)), candidates);
+        let survivors = narrow(
+            &mem,
+            DataType::I32,
+            ScanStep::Equal(int(10)),
+            &candidates,
+            &ScanControl::new(),
+        );
         assert!(survivors.is_empty(), "no longer matching, so dropped");
     }
 
@@ -855,7 +1100,13 @@ mod tests {
                 interp: Interp::Both,
             },
         ];
-        let survivors = narrow(&mem, DataType::I32, ScanStep::Equal(int(7)), candidates);
+        let survivors = narrow(
+            &mem,
+            DataType::I32,
+            ScanStep::Equal(int(7)),
+            &candidates,
+            &ScanControl::new(),
+        );
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0].addr, 0x3000);
     }
@@ -868,7 +1119,13 @@ mod tests {
             old: 1i32.to_le_bytes().to_vec(),
             interp: Interp::Signed,
         }];
-        let survivors = narrow(&mem, DataType::I32, ScanStep::Update, candidates);
+        let survivors = narrow(
+            &mem,
+            DataType::I32,
+            ScanStep::Update,
+            &candidates,
+            &ScanControl::new(),
+        );
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0].old, 99i32.to_le_bytes());
         assert_eq!(survivors[0].interp, Interp::Signed);
@@ -878,7 +1135,7 @@ mod tests {
     fn holes_between_mappings_are_skipped() {
         // fake memory only readable from 0x2000 on; the range starts earlier
         let mem = memory(0x2000, &50i32.to_le_bytes());
-        let (candidates, total) = scan_range(
+        let (candidates, total) = sweep_range(
             &mem,
             0x1000,
             0x2003,
@@ -896,7 +1153,7 @@ mod tests {
         let at = CHUNK - 1;
         bytes[at..at + 4].copy_from_slice(&50i32.to_le_bytes());
         let mem = memory(0x1000, &bytes);
-        let (candidates, total) = scan_range(
+        let (candidates, total) = sweep_range(
             &mem,
             0x1000,
             0x1000 + (CHUNK - 1) as u64,
@@ -906,7 +1163,7 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(candidates[0].addr, 0x1000 + at as u64);
         // and nothing is matched twice
-        let (candidates, total) = scan_range(
+        let (candidates, total) = sweep_range(
             &mem,
             0x1000,
             0x1000 + (CHUNK + 3) as u64,
@@ -915,5 +1172,175 @@ mod tests {
         );
         assert_eq!(total, 1);
         assert_eq!(candidates[0].addr, 0x1000 + at as u64);
+    }
+
+    #[test]
+    #[expect(clippy::unreadable_literal)]
+    fn maps_text_becomes_merged_and_clipped_spans() {
+        let maps = "400000-401000 r--p 00000000 08:01 123 /a\n\
+                    401000-402000 rw-p 00000000 08:01 123 /a\n\
+                    402000-403000 ---p 00000000 08:01 123 \n\
+                    403000-405000 rw-p 00000000 08:01 123 /b\n\
+                    500000-501000 r-xp 00000000 08:01 124 /c\n\
+                    (garbage line)\n";
+        // touching mappings merge; the gap at 0x405000 splits
+        let spans = spans_from_maps(maps, 0x400000, 0x600000);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            spans[0],
+            Span {
+                start: 0x400000,
+                end: 0x405000,
+                padded: false
+            }
+        );
+        assert_eq!(
+            spans[1],
+            Span {
+                start: 0x500000,
+                end: 0x501000,
+                padded: false
+            }
+        );
+
+        // clipping to a window: entries outside drop, the rest lose their
+        // unclipped parts, and a clipped end is padded
+        let spans = spans_from_maps(maps, 0x400800, 0x404000);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0],
+            Span {
+                start: 0x400800,
+                end: 0x404001,
+                padded: true
+            }
+        );
+
+        // no maps available: one pseudo-span crawls the raw range
+        assert_eq!(
+            clipped_spans(u32::MAX, 5, 9),
+            vec![Span {
+                start: 5,
+                end: 10,
+                padded: true
+            }]
+        );
+    }
+
+    #[test]
+    fn chunk_boundaries_are_page_aligned_and_inside_the_span() {
+        // tiny spans stay whole
+        assert_eq!(chunk_starts(0x1000, 0x1004, 8 * 1024 * 1024), vec![0x1000]);
+        // boundaries land on pages
+        assert_eq!(
+            chunk_starts(0x1000, 0x1000 + 20 * 4096, 8 * 4096),
+            vec![0x1000, 0x9000, 0x11000]
+        );
+        // a boundary past the end never appears
+        assert_eq!(
+            chunk_starts(0x1ff8, 0x3000, 4096),
+            vec![0x1ff8] // next candidate boundary 0x3000 == end, so one chunk
+        );
+        assert_eq!(chunk_starts(0x1ff8, 0x4000, 4096), vec![0x1ff8, 0x3000]);
+    }
+
+    #[test]
+    fn values_on_chunk_boundaries_are_found_exactly_once() {
+        // 5 pages of memory with a value on each side of every boundary
+        let mut bytes = vec![0u8; 5 * 4096];
+        for &offset in &[4091u64, 4096, 8187, 8192] {
+            bytes[offset as usize..offset as usize + 4].copy_from_slice(&7i32.to_le_bytes());
+        }
+        let mem = memory(0x10000, &bytes);
+        let control = ScanControl::new();
+        let span = Span {
+            start: 0x10000,
+            end: 0x10000 + 5 * 4096,
+            padded: false,
+        };
+        let (candidates, total) = sweep_span(
+            &mem,
+            &span,
+            DataType::I32,
+            ScanStep::Equal(int(7)),
+            &control,
+            4096,
+        );
+        assert_eq!(total, 4);
+        let addrs: Vec<u64> = candidates.iter().map(|c| c.addr).collect();
+        assert_eq!(
+            addrs,
+            vec![
+                0x10000 + 4091,
+                0x10000 + 4096,
+                0x10000 + 8187,
+                0x10000 + 8192
+            ]
+        );
+        // ascending order survived the parallel chunks
+        assert!(addrs.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn cancel_stops_the_sweep_and_narrowing() {
+        let mem = memory(0x1000, &50i32.to_le_bytes());
+        let control = ScanControl::new();
+        control.cancel();
+        let span = Span {
+            start: 0x1000,
+            end: 0x1010,
+            padded: true,
+        };
+        let (candidates, total) = sweep(
+            &mem,
+            &[span],
+            DataType::I32,
+            ScanStep::Equal(int(50)),
+            &control,
+        );
+        assert_eq!((candidates.len(), total), (0, 0));
+
+        let candidates = vec![Candidate {
+            addr: 0x1000,
+            old: 50i32.to_le_bytes().to_vec(),
+            interp: Interp::Both,
+        }];
+        let survivors = narrow(
+            &mem,
+            DataType::I32,
+            ScanStep::Equal(int(50)),
+            &candidates,
+            &control,
+        );
+        assert_eq!(survivors.len(), 0);
+    }
+
+    #[test]
+    fn sweep_reports_progress() {
+        // 3 pages with the byte 7 on every even offset
+        let mut bytes = vec![0u8; 3 * 4096];
+        for chunk in bytes.chunks_mut(2) {
+            chunk[0] = 7;
+        }
+        let mem = memory(0x10000, &bytes);
+        let control = ScanControl::new();
+        control.set_total(3 * 4096);
+        let span = Span {
+            start: 0x10000,
+            end: 0x10000 + 3 * 4096,
+            padded: false,
+        };
+        let (candidates, total) = sweep(
+            &mem,
+            &[span],
+            DataType::I8,
+            ScanStep::Equal(int(7)),
+            &control,
+        );
+        assert_eq!(total, 3 * 4096 / 2);
+        assert_eq!(candidates.len() as u64, total); // far below the cap, so all are stored
+        let (done, reported_total) = control.progress();
+        assert_eq!(reported_total, 3 * 4096);
+        assert!(done > 0);
     }
 }

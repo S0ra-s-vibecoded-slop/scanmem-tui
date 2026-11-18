@@ -131,9 +131,19 @@ fn prompt_title(app: &App, kind: InputKind) -> String {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let line = match &app.job {
-        Some(job) => spinner_line(job.label, job.progress, job.since),
-        None => Line::styled(
+    let line = match (&app.job, &app.range_job) {
+        (Some(job), _) => spinner_line(
+            job.label,
+            job.progress
+                .map(|(done, total)| format!("region {done}/{total}")),
+            job.since,
+        ),
+        (None, Some(range)) => spinner_line(
+            range.label,
+            range.percent().map(|percent| format!("{percent}%")),
+            range.since,
+        ),
+        (None, None) => Line::styled(
             app.status.text.clone(),
             Style::new().fg(level_color(app.status.level)),
         ),
@@ -144,19 +154,17 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn spinner_line(label: &str, progress: Option<(u32, u32)>, since: Instant) -> Line<'static> {
+fn spinner_line(label: &str, detail: Option<String>, since: Instant) -> Line<'static> {
     let frame = SPINNER[(since.elapsed().as_millis() / SPINNER_FRAME_MS) as usize % SPINNER.len()];
-    let progress = match progress {
-        Some((done, total)) => format!(" region {done}/{total}"),
-        None => String::new(),
-    };
-    Line::from(vec![
-        Span::styled(
-            format!("{frame} {label}{progress}"),
-            Style::new().fg(Color::Yellow),
-        ),
-        Span::styled("   Esc to stop", dim()),
-    ])
+    let mut spans = vec![Span::styled(
+        format!("{frame} {label}"),
+        Style::new().fg(Color::Yellow),
+    )];
+    if let Some(detail) = detail {
+        spans.push(Span::styled(format!("   {detail}"), dim()));
+    }
+    spans.push(Span::styled("   Esc to stop", dim()));
+    Line::from(spans)
 }
 
 fn level_color(level: Level) -> Color {

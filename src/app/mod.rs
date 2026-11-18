@@ -21,6 +21,7 @@ use crate::stats::Stats;
 use anyhow::{Context, Result};
 use jobs::Job;
 use picker::Picker;
+use rangescan::RangeJob;
 use ratatui::widgets::TableState;
 use results::Results;
 use saved::SavedList;
@@ -94,6 +95,8 @@ pub struct App {
     events: Receiver<BackendEvent>,
     backend_dead: bool,
     pub job: Option<Job>,
+    /// The range scan running on its own thread, if any.
+    pub range_job: Option<RangeJob>,
 
     pub freezer: Freezer,
     pub stats: Stats,
@@ -130,6 +133,7 @@ impl App {
 
     pub fn tick(&mut self) {
         self.drain_backend_events();
+        self.drain_range_job();
         self.refresh_live_values_if_due();
         self.refresh_stats_if_due();
         self.keep_spinner_turning();
@@ -145,7 +149,7 @@ impl App {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.range_job.is_some()
     }
 
     fn new(
@@ -159,6 +163,7 @@ impl App {
             events,
             backend_dead: false,
             job: None,
+            range_job: None,
             freezer,
             stats: Stats::new(),
             target: None,

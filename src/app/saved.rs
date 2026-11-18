@@ -210,6 +210,9 @@ impl App {
     /// Applies a typed type change. The old saved value was written in the
     /// previous layout, so it (and any freeze) is dropped on a real change.
     pub(super) fn apply_saved_type(&mut self, index: usize, text: &str) {
+        if self.is_busy() {
+            return self.say(Level::Warn, "scanmem is busy");
+        }
         let Some(item) = self.saved.items.get_mut(index) else {
             return;
         };

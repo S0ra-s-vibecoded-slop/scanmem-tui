@@ -160,7 +160,11 @@ impl App {
             self.saved.release_all();
             self.sync_freezer();
         }
-        // A new process means a new address space: any range limit is void.
+        // A new process means a new address space: any range limit is void,
+        // and a range scan in flight belongs to the old one.
+        if let Some(job) = self.range_job.take() {
+            job.control.cancel();
+        }
         self.scan_range = None;
         self.candidates.clear();
         self.results.clear();
