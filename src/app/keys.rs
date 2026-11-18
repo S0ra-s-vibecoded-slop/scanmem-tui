@@ -53,7 +53,10 @@ impl App {
             Action::AddAddress => self.begin_input(InputKind::AddAddr, String::new()),
             Action::SaveResult => self.save_selected_result(),
             Action::SetValue => self.begin_set_value(),
-            Action::EditDescription => self.begin_describe(),
+            Action::EditLabel => self.begin_label(),
+            Action::EditType => self.begin_edit_type(),
+            Action::ReorderDown => self.reorder_saved(1),
+            Action::ReorderUp => self.reorder_saved(-1),
             Action::ToggleFreeze => self.toggle_freeze(),
             Action::RemoveSaved => self.remove_selected(),
         }

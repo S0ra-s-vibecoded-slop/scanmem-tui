@@ -110,7 +110,8 @@ fn draw_prompt(f: &mut Frame, app: &App, kind: InputKind, area: Rect) {
 fn prompt_title(app: &App, kind: InputKind) -> String {
     match kind {
         InputKind::Scan => {
-            " Scan: value | > N | < N | = | != | + | - | snapshot | reset ".to_string()
+            " Scan: value | > N | < N | = | != | + | - | snapshot | reset | range <label|addr> <offset> "
+                .to_string()
         }
         InputKind::SetValue(index) => match app.saved.items.get(index) {
             Some(saved) => format!(
@@ -120,8 +121,12 @@ fn prompt_title(app: &App, kind: InputKind) -> String {
             ),
             None => " Write value ".to_string(),
         },
-        InputKind::Describe(_) => " Description ".to_string(),
-        InputKind::AddAddr => " Add address: <hex> [type]  e.g. 7ffc8dc5328c int32 ".to_string(),
+        InputKind::Label(_) => " Label (letters, digits and _) ".to_string(),
+        InputKind::EditType(_) => " Type: int8/16/32/64, float32/64 ".to_string(),
+        InputKind::AddAddr => {
+            " Add address: <label|addr>±<offset> [type]  e.g. 7ffc8dc5328c, health+0x10, 0xaddr-0x1140 int32 "
+                .to_string()
+        }
     }
 }
 

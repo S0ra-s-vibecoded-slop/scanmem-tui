@@ -7,6 +7,7 @@ mod jobs;
 mod keys;
 mod picker;
 mod prompt;
+mod rangescan;
 mod results;
 mod saved;
 
@@ -15,6 +16,7 @@ use crate::datatype::DataType;
 use crate::freezer::Freezer;
 use crate::memio::MemIo;
 use crate::scanmem::{Backend, BackendEvent};
+use crate::scanner::Candidate;
 use crate::stats::Stats;
 use anyhow::{Context, Result};
 use jobs::Job;
@@ -54,7 +56,9 @@ pub struct Status {
 pub enum InputKind {
     Scan,
     SetValue(usize),
-    Describe(usize),
+    Label(usize),
+    /// Change the type of a saved address.
+    EditType(usize),
     AddAddr,
 }
 
@@ -95,6 +99,11 @@ pub struct App {
     pub stats: Stats,
     pub target: Option<Target>,
     pub scan_type: DataType,
+    /// Active scan limit `(lo, hi)` set by `range`; `None` scans everywhere.
+    /// While set, scans run on the built-in scanner instead of scanmem.
+    pub scan_range: Option<(u64, u64)>,
+    /// The built-in scanner's matches; only meaningful while `scan_range` is.
+    pub candidates: Vec<Candidate>,
     pub results: Results,
     pub saved: SavedList,
     pub picker: Picker,
@@ -154,6 +163,8 @@ impl App {
             stats: Stats::new(),
             target: None,
             scan_type,
+            scan_range: None,
+            candidates: Vec::new(),
             results: Results::new(),
             saved: SavedList::new(),
             picker: Picker::empty(),

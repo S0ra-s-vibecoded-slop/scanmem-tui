@@ -10,6 +10,7 @@ mod gpu;
 mod keymap;
 mod memio;
 mod scanmem;
+mod scanner;
 mod stats;
 mod ui;
 

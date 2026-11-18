@@ -79,7 +79,10 @@ mod tests {
 
     #[test]
     fn scan_type_accepts_aliases() {
-        assert_eq!(parse(&["--type", "float"]).unwrap().scan_type, DataType::F32);
+        assert_eq!(
+            parse(&["--type", "float"]).unwrap().scan_type,
+            DataType::F32
+        );
         assert_eq!(parse(&[]).unwrap().scan_type, DataType::I32);
         assert!(parse(&["--type", "banana"]).is_err());
     }

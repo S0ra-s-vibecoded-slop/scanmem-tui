@@ -42,14 +42,27 @@ pub struct Results {
 
 impl Results {
     pub fn new() -> Results {
-        Results { rows: Vec::new(), state: TableState::default(), total: 0, viewport: 20 }
+        Results {
+            rows: Vec::new(),
+            state: TableState::default(),
+            total: 0,
+            viewport: 20,
+        }
     }
 
     pub fn clear(&mut self) {
-        *self = Results { viewport: self.viewport, ..Results::new() };
+        *self = Results {
+            viewport: self.viewport,
+            ..Results::new()
+        };
     }
 
-    pub fn replace(&mut self, matches: Vec<Match>, reported_count: Option<u64>, scan_type: DataType) {
+    pub fn replace(
+        &mut self,
+        matches: Vec<Match>,
+        reported_count: Option<u64>,
+        scan_type: DataType,
+    ) {
         let shown = matches.len() as u64;
         let capped = matches.len() >= MAX_RESULTS;
         self.total = match reported_count {
@@ -57,7 +70,10 @@ impl Results {
             None if capped => self.total.max(shown),
             None => shown,
         };
-        self.rows = matches.into_iter().map(|m| ResultRow::new(m, scan_type)).collect();
+        self.rows = matches
+            .into_iter()
+            .map(|m| ResultRow::new(m, scan_type))
+            .collect();
         self.state = TableState::default();
         if !self.rows.is_empty() {
             self.state.select(Some(0));

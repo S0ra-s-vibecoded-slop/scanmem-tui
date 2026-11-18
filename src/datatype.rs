@@ -50,6 +50,11 @@ impl DataType {
         Self::ALL[(self as usize + 1) % Self::ALL.len()]
     }
 
+    /// Whether values of this type are floating point rather than integer.
+    pub fn is_float(self) -> bool {
+        matches!(self, DataType::F32 | DataType::F64)
+    }
+
     /// Parse a flag token from scanmem's `list` output (`I32`, `I32u`, `F64`...).
     pub fn from_flag(token: &str) -> Option<DataType> {
         match token.trim_end_matches(['u', 's']) {
@@ -127,7 +132,8 @@ impl FromStr for DataType {
     }
 }
 
-fn parse_int(text: &str) -> Option<i128> {
+/// User-typed integers: `0x10` is hex, everything else decimal, sign allowed.
+pub(crate) fn parse_int(text: &str) -> Option<i128> {
     let (negative, body) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, text.strip_prefix('+').unwrap_or(text)),

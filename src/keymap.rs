@@ -16,7 +16,10 @@ pub enum Action {
     SaveResult,
     SetValue,
     ToggleFreeze,
-    EditDescription,
+    EditLabel,
+    EditType,
+    ReorderDown,
+    ReorderUp,
     RemoveSaved,
     AddAddress,
     SwitchPane,
@@ -111,7 +114,7 @@ static BINDINGS: &[Binding] = &[
     },
     Binding {
         section: Scanning, action: StartScan, keys: &[ch('s'), ch('/')],
-        label: "s or /", hint: "s scan", help: "enter a scan: a value (100, 3.5), > N, < N, =, !=, +, -, snapshot",
+        label: "s or /", hint: "s scan", help: "enter a scan: a value (100, 3.5), > N, < N, =, !=, +, -, snapshot, or `range <label|addr> <offset>`",
     },
     Binding {
         section: Scanning, action: NewScan, keys: &[ch('n')],
@@ -138,8 +141,20 @@ static BINDINGS: &[Binding] = &[
         label: "Space", hint: "Space freeze", help: "tick/untick the checkbox; while [x] the value is re-written continuously",
     },
     Binding {
-        section: Saved, action: EditDescription, keys: &[ch('e')],
-        label: "e", hint: "e name", help: "edit the description",
+        section: Saved, action: EditLabel, keys: &[ch('e')],
+        label: "e", hint: "e label", help: "set the label (letters, digits and _); use it at the scan prompt as `range <label> <offset>`",
+    },
+    Binding {
+        section: Saved, action: EditType, keys: &[ch('T')],
+        label: "T", hint: "T type", help: "change the type of the selected address (drops its saved value, if any)",
+    },
+    Binding {
+        section: Saved, action: ReorderDown, keys: &[ch('J')],
+        label: "J", hint: "J down", help: "move the selected row down the list",
+    },
+    Binding {
+        section: Saved, action: ReorderUp, keys: &[ch('K')],
+        label: "K", hint: "K up", help: "move the selected row up the list",
     },
     Binding {
         section: Saved, action: RemoveSaved, keys: &[ch('d'), KeyCode::Delete],
@@ -147,7 +162,7 @@ static BINDINGS: &[Binding] = &[
     },
     Binding {
         section: General, action: AddAddress, keys: &[ch('A')],
-        label: "A", hint: "A add addr", help: "add an address by hand: 7ffc8dc5328c int32",
+        label: "A", hint: "A add addr", help: "add an address by hand: 7ffc8dc5328c int32, or `label+0x10` / `0xaddr-0x1140`",
     },
     Binding {
         section: General, action: SwitchPane, keys: &[KeyCode::Tab, KeyCode::BackTab],

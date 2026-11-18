@@ -59,6 +59,11 @@ impl App {
         if self.is_busy() {
             return self.say(Level::Warn, "scanmem is busy");
         }
+        if command == "reset" {
+            // `reset` re-reads every region, so any range limit is gone.
+            self.scan_range = None;
+            self.candidates.clear();
+        }
         let commands = &[command.to_string(), format!("list {MAX_RESULTS}")];
         self.start_job(commands, JobKind::Scan, "Scanning");
     }
@@ -120,6 +125,9 @@ impl App {
             return self.say(Level::Error, error);
         }
         self.scan_type = ty;
+        // Candidates remember the previous type's byte layout; a new width
+        // would misread them, so they start over with the next scan.
+        self.candidates.clear();
         match warning {
             Some(warning) => self.say(Level::Warn, warning),
             None => self.say(Level::Info, format!("Scan type: {}", ty.scanmem_name())),
@@ -152,6 +160,9 @@ impl App {
             self.saved.release_all();
             self.sync_freezer();
         }
+        // A new process means a new address space: any range limit is void.
+        self.scan_range = None;
+        self.candidates.clear();
         self.results.clear();
         self.refresh_live();
     }
@@ -185,7 +196,7 @@ impl App {
         self.report_scan(error);
     }
 
-    fn report_scan(&mut self, error: Option<String>) {
+    pub(super) fn report_scan(&mut self, error: Option<String>) {
         let total = self.results.total;
         let shown = self.results.rows.len();
         if let Some(error) = error {
@@ -208,4 +219,21 @@ impl App {
 
 fn set_type_command(ty: DataType) -> String {
     format!("option scan_data_type {}", ty.scanmem_name())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::saved::SavedList;
+    use super::*;
+
+    #[test]
+    #[expect(clippy::unreadable_literal)]
+    fn labels_are_found_case_insensitively() {
+        let mut saved = SavedList::new();
+        saved.add(0x140902b8a, DataType::I32);
+        saved.items[0].label = "health".into();
+        assert_eq!(saved.labelled("health"), Some(0x140902b8a));
+        assert_eq!(saved.labelled("HEALTH"), Some(0x140902b8a));
+        assert_eq!(saved.labelled("other"), None);
+    }
 }

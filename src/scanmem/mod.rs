@@ -8,4 +8,4 @@ mod backend;
 mod parse;
 
 pub use backend::{Backend, BackendEvent};
-pub use parse::{parse_output, Match, Parsed};
+pub use parse::{Match, Parsed, parse_output};

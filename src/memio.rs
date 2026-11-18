@@ -18,11 +18,17 @@ impl MemIo {
     pub fn open(pid: u32) -> io::Result<MemIo> {
         let path = format!("/proc/{pid}/mem");
         if let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) {
-            return Ok(MemIo { file, writable: true });
+            return Ok(MemIo {
+                file,
+                writable: true,
+            });
         }
         // Read-only still lets us display values.
         let file = File::open(&path)?;
-        Ok(MemIo { file, writable: false })
+        Ok(MemIo {
+            file,
+            writable: false,
+        })
     }
 
     pub fn read_into(&self, addr: u64, buf: &mut [u8]) -> io::Result<()> {
