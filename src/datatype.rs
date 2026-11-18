@@ -87,9 +87,21 @@ impl DataType {
         }
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     fn parse_integer(self, text: &str) -> Result<Vec<u8>, String> {
         let n = parse_int(text).ok_or_else(|| format!("`{text}` is not a valid integer"))?;
+        self.encode_int(n)
+    }
+
+    /// Little-endian bytes for integer `n`, accepting the signed range plus the
+    /// unsigned spelling (an i8 takes -128..=255, like the scan prompt).
+    #[expect(clippy::cast_possible_truncation)]
+    pub fn encode_int(self, n: i128) -> Result<Vec<u8>, String> {
+        if self.is_float() {
+            return Err(format!(
+                "{} needs a floating point value",
+                self.scanmem_name()
+            ));
+        }
         let bits = (self.size() * 8) as u32;
         let min_signed = -(1i128 << (bits - 1));
         let max_unsigned = (1i128 << bits) - 1;

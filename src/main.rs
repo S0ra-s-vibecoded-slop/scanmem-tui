@@ -2,6 +2,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::enum_glob_use)]
 
+mod address;
 mod app;
 mod args;
 mod datatype;
@@ -11,6 +12,7 @@ mod keymap;
 mod memio;
 mod scanmem;
 mod scanner;
+mod scripts;
 mod stats;
 mod ui;
 
@@ -60,6 +62,15 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         handle_input(app)?;
         app.tick();
+        while let Some((path, user)) = app.take_editor_request() {
+            match scripts::editor::edit(terminal, &path, user.as_ref()) {
+                Ok(()) => app.finish_editor(&path),
+                Err(reason) => {
+                    app.editor_failed(&reason);
+                    app.finish_editor(&path);
+                }
+            }
+        }
     }
     Ok(())
 }

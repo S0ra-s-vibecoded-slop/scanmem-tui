@@ -10,6 +10,7 @@ mod prompt;
 mod rangescan;
 mod results;
 mod saved;
+mod scripttab;
 
 use crate::args::Args;
 use crate::datatype::DataType;
@@ -17,6 +18,9 @@ use crate::freezer::Freezer;
 use crate::memio::MemIo;
 use crate::scanmem::{Backend, BackendEvent};
 use crate::scanner::Candidate;
+use crate::scripts::engine::{Engine, Label};
+use crate::scripts::paths::ScriptsRoot;
+use crate::scripts::store::Scripts;
 use crate::stats::Stats;
 use anyhow::{Context, Result};
 use jobs::Job;
@@ -25,6 +29,8 @@ use rangescan::RangeJob;
 use ratatui::widgets::TableState;
 use results::Results;
 use saved::SavedList;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -35,9 +41,24 @@ const LIVE_REFRESH: Duration = Duration::from_millis(250);
 const STATS_REFRESH: Duration = Duration::from_millis(1000);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Memory,
+    Scripts,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Results,
     Saved,
+}
+
+/// The yes/no popups on the Scripts tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Confirm {
+    /// Remove from the list, leaving the file alone.
+    Delist(u64),
+    /// Delete the file itself.
+    DeleteFile(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,12 +82,17 @@ pub enum InputKind {
     /// Change the type of a saved address.
     EditType(usize),
     AddAddr,
+    /// Import a `.lua` file, or every `.lua` directly inside a folder.
+    ImportScript,
+    /// Create a script inside the scripts folder from a relative path.
+    NewScript,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Input(InputKind),
+    Confirm(Confirm),
     Picker,
     Help,
 }
@@ -111,6 +137,13 @@ pub struct App {
     pub saved: SavedList,
     pub picker: Picker,
 
+    pub tab: Tab,
+    pub scripts: Scripts,
+    /// The Lua thread; UI talks to it through commands and events only.
+    engine: Engine,
+    /// Set when the event loop should hand the terminal to `$EDITOR`.
+    editor_request: Option<PathBuf>,
+
     pub focus: Focus,
     pub mode: Mode,
     pub input: String,
@@ -126,14 +159,27 @@ impl App {
     pub fn start(args: &Args) -> Result<App> {
         let (backend, events) = Backend::spawn(&args.scanmem).context("starting scanmem")?;
         let freezer = Freezer::start(args.freeze_interval());
-        let mut app = App::new(backend, events, freezer, args.scan_type);
+        let engine = Engine::start(args.lua_full);
+        let mut scripts = Scripts::new(ScriptsRoot::from_arg(args.scripts_dir.as_deref()));
+        let startup = scripts.load_startup();
+        let mut app = App::new(backend, events, freezer, engine, scripts, args.scan_type);
         app.begin_session(args.target_pid());
+        if let Some(message) = startup {
+            app.say(Level::Warn, message);
+        }
+        if args.lua_full {
+            app.say(
+                Level::Warn,
+                "--lua-full: scripts can read files, run commands and use package.",
+            );
+        }
         Ok(app)
     }
 
     pub fn tick(&mut self) {
         self.drain_backend_events();
         self.drain_range_job();
+        self.drain_script_events();
         self.refresh_live_values_if_due();
         self.refresh_stats_if_due();
         self.keep_spinner_turning();
@@ -156,6 +202,8 @@ impl App {
         backend: Backend,
         events: Receiver<BackendEvent>,
         freezer: Freezer,
+        engine: Engine,
+        scripts: Scripts,
         scan_type: DataType,
     ) -> App {
         App {
@@ -173,6 +221,10 @@ impl App {
             results: Results::new(),
             saved: SavedList::new(),
             picker: Picker::empty(),
+            tab: Tab::Memory,
+            scripts,
+            engine,
+            editor_request: None,
             focus: Focus::Results,
             mode: Mode::Normal,
             input: String::new(),
@@ -229,6 +281,9 @@ impl App {
     fn on_backend_exited(&mut self, last_lines: &[String]) {
         self.backend_dead = true;
         self.job = None;
+        // The session is over as far as scanning goes: scripts stop with it.
+        self.disable_all_scripts();
+        self.engine.set_memory(None);
         let tail = last_lines[last_lines.len().saturating_sub(2)..].join(" ");
         self.say(Level::Error, format!("scanmem exited. {tail}"));
     }
@@ -261,6 +316,35 @@ impl App {
 
     fn sync_freezer(&self) {
         self.freezer.set_targets(self.saved.freeze_targets());
+    }
+
+    /// Points the engine at the current target. It opens its own
+    /// `/proc/<pid>/mem`, so the TUI's reads and the scripts' writes never
+    /// share a seek position.
+    fn sync_script_memory(&self) {
+        let memory = self
+            .target
+            .as_ref()
+            .and_then(|target| MemIo::open(target.pid).ok())
+            .map(|memory| Arc::new(memory) as Arc<dyn crate::scripts::engine::Memory>);
+        self.engine.set_memory(memory);
+    }
+
+    /// Pushes labels after the saved list changes; scripts resolve only these.
+    fn sync_script_labels(&self) {
+        let labels = self
+            .saved
+            .items
+            .iter()
+            .filter(|item| !item.label.is_empty())
+            .map(|item| Label {
+                name: item.label.clone(),
+                addr: item.addr,
+                ty: item.ty,
+                frozen: item.frozen,
+            })
+            .collect();
+        self.engine.set_labels(labels);
     }
 }
 

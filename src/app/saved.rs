@@ -157,6 +157,7 @@ impl App {
             return self.say(Level::Info, format!("0x{addr:x} is already in the list"));
         }
         self.refresh_live();
+        self.sync_script_labels();
         self.say(
             Level::Ok,
             format!(
@@ -188,6 +189,7 @@ impl App {
         let addr = item.addr;
         if text.is_empty() {
             item.label.clear();
+            self.sync_script_labels();
             return self.say(Level::Info, "Label cleared");
         }
         if !text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -197,6 +199,7 @@ impl App {
             );
         }
         item.label = text.to_string();
+        self.sync_script_labels();
         self.say(Level::Ok, format!("Labelled 0x{addr:x} as `{text}`"));
     }
 
@@ -235,6 +238,7 @@ impl App {
             self.sync_freezer();
         }
         self.refresh_live();
+        self.sync_script_labels();
         self.say(
             Level::Ok,
             format!("0x{addr:x} is now {}", ty.scanmem_name()),
@@ -255,12 +259,14 @@ impl App {
         item.frozen = !item.frozen;
         let message = item.freeze_message();
         self.sync_freezer();
+        self.sync_script_labels();
         self.say(Level::Ok, message);
     }
 
     pub(super) fn remove_selected(&mut self) {
         if self.saved.remove_selected() {
             self.sync_freezer();
+            self.sync_script_labels();
             self.say(Level::Info, "Removed from list");
         }
     }

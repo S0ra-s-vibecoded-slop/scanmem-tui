@@ -152,6 +152,7 @@ impl App {
 
     fn switch_target(&mut self, pid: u32, name: String) {
         let is_new_process = self.target.as_ref().map(|target| target.pid) != Some(pid);
+        self.disable_all_scripts();
         self.target = Some(Target::attach(pid, name));
         self.stats.track(Some(pid));
         self.freezer.set_pid(Some(pid));
@@ -160,6 +161,8 @@ impl App {
             self.saved.release_all();
             self.sync_freezer();
         }
+        self.sync_script_memory();
+        self.sync_script_labels();
         // A new process means a new address space: any range limit is void,
         // and a range scan in flight belongs to the old one.
         if let Some(job) = self.range_job.take() {

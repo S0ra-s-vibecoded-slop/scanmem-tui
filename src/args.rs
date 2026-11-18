@@ -3,6 +3,7 @@
 use crate::datatype::DataType;
 use crate::freezer::{DEFAULT_INTERVAL_MS, MIN_INTERVAL_MS};
 use clap::Parser;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// scanmem-tui - a terminal frontend for scanmem
@@ -37,6 +38,14 @@ pub struct Args {
     /// Initial scan type: int8, int16, int32, int64, float32 or float64
     #[arg(long = "type", value_name = "TYPE", default_value = "int32")]
     pub scan_type: DataType,
+
+    /// Folder of Lua scripts: load it at startup, and create new scripts there
+    #[arg(long, value_name = "DIR", env = "SCANMEM_TUI_SCRIPTS_DIR")]
+    pub scripts_dir: Option<PathBuf>,
+
+    /// Give scripts the full Lua standard library (files, os.execute, ...)
+    #[arg(long, env = "SCANMEM_TUI_LUA_FULL")]
+    pub lua_full: bool,
 }
 
 impl Args {
@@ -85,5 +94,13 @@ mod tests {
         );
         assert_eq!(parse(&[]).unwrap().scan_type, DataType::I32);
         assert!(parse(&["--type", "banana"]).is_err());
+    }
+
+    #[test]
+    fn scripts_flags() {
+        let args = parse(&["--scripts-dir", "/tmp/my-scripts"]).unwrap();
+        assert_eq!(args.scripts_dir, Some(PathBuf::from("/tmp/my-scripts")));
+        assert!(!args.lua_full);
+        assert!(parse(&["--lua-full"]).unwrap().lua_full);
     }
 }

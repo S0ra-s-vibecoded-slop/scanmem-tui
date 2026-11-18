@@ -3,7 +3,7 @@
 mod panes;
 mod popups;
 
-use crate::app::{App, InputKind, Level, Mode};
+use crate::app::{App, InputKind, Level, Mode, Tab};
 use crate::keymap;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -21,19 +21,27 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let inner = outer.inner(screen);
     f.render_widget(outer, screen);
 
-    let [header, main, bottom, hints] = Layout::vertical([
+    let [header, tabs, main, bottom, hints] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(5),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
     .areas(inner);
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(main);
 
     draw_header(f, app, header);
-    panes::draw_results(f, app, left);
-    panes::draw_saved(f, app, right);
+    draw_tabs(f, app, tabs);
+    match app.tab {
+        Tab::Memory => {
+            let [left, right] =
+                Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+                    .areas(main);
+            panes::draw_results(f, app, left);
+            panes::draw_saved(f, app, right);
+        }
+        Tab::Scripts => panes::draw_scripts(f, app, main),
+    }
     draw_bottom(f, app, bottom);
     draw_hints(f, app, hints);
     popups::draw(f, app);
@@ -88,6 +96,25 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
+fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let tab = |label: &str, active: bool| {
+        if active {
+            Span::styled(
+                format!(" {label} "),
+                Style::new().bold().fg(Color::Black).bg(Color::Cyan),
+            )
+        } else {
+            Span::styled(format!(" {label} "), dim())
+        }
+    };
+    let line = Line::from(vec![
+        tab("1 Memory", app.tab == Tab::Memory),
+        Span::raw(" "),
+        tab("2 Scripts", app.tab == Tab::Scripts),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
 fn draw_bottom(f: &mut Frame, app: &App, area: Rect) {
     match app.mode {
         Mode::Input(kind) => draw_prompt(f, app, kind, area),
@@ -127,6 +154,13 @@ fn prompt_title(app: &App, kind: InputKind) -> String {
             " Add address: <label|addr>±<offset> [type]  e.g. 7ffc8dc5328c, health+0x10, 0xaddr-0x1140 int32 "
                 .to_string()
         }
+        InputKind::ImportScript => {
+            " Import script: path to a .lua file or a folder (~ allowed) ".to_string()
+        }
+        InputKind::NewScript => format!(
+            " New script in {}: relative path, .lua added ",
+            app.scripts.root.dir.display()
+        ),
     }
 }
 
@@ -179,9 +213,10 @@ fn level_color(level: Level) -> Color {
 fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode {
         Mode::Input(_) => "Enter confirm   Esc cancel   Ctrl-U clear".to_string(),
+        Mode::Confirm(_) => "y confirm   n cancel".to_string(),
         Mode::Picker => "type to filter   ↑↓ choose   Enter attach   Esc cancel".to_string(),
         Mode::Help => "any key to close".to_string(),
-        Mode::Normal => keymap::hint_line(app.focus),
+        Mode::Normal => keymap::hint_line(app.tab, app.focus),
     };
     f.render_widget(
         Paragraph::new(text)

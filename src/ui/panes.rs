@@ -3,10 +3,10 @@
 use super::{dim, framed};
 use crate::app::{App, Focus, ResultRow, Saved};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, Wrap};
 
 const RESULTS_NEED_PROCESS: &str = "Press p to pick a process.";
 const RESULTS_EMPTY: &str = "No results.\n\nPress s and type a value (e.g. 100),\nor `snapshot` to start without one.\nThen narrow down with: value, > N, < N,\n=, !=, +, -";
@@ -178,4 +178,105 @@ fn draw_placeholder(f: &mut Frame, block: Block<'_>, area: Rect, message: &str) 
             .wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+/// The Scripts tab: sidebar, read-only preview, and the selected script's log.
+pub fn draw_scripts(f: &mut Frame, app: &App, area: Rect) {
+    let [sidebar, right] =
+        Layout::horizontal([Constraint::Length(30), Constraint::Min(20)]).areas(area);
+    let [preview, log] =
+        Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(right);
+    draw_script_list(f, app, sidebar);
+    draw_preview(f, app, preview);
+    draw_log(f, app, log);
+}
+
+fn draw_script_list(f: &mut Frame, app: &App, area: Rect) {
+    let block = framed(Color::Cyan, format!(" Scripts ({}) ", app.scripts.len()));
+    if app.scripts.is_empty() {
+        let empty = format!(
+            "No scripts yet.\n\nPress i to import a .lua file or folder,\nor n to create one in:\n{}\n\nSpace starts and stops the selected script.",
+            app.scripts.root.dir.display()
+        );
+        return draw_placeholder(f, block, area, &empty);
+    }
+    let items: Vec<ListItem> = app
+        .scripts
+        .scripts()
+        .iter()
+        .map(|script| {
+            let marker = if script.enabled { "●" } else { "○" };
+            let style = if script.problem.is_some() {
+                Style::new().fg(Color::Red)
+            } else if script.enabled {
+                Style::new().fg(Color::Green)
+            } else {
+                Style::new()
+            };
+            ListItem::new(format!("{marker} {}", script.name)).style(style)
+        })
+        .collect();
+    let mut state = ListState::default().with_selected(Some(app.scripts.selected));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
+    let title = match app.scripts.selected_script() {
+        Some(script) => format!(" {} ", script.path.display()),
+        None => " Preview ".to_string(),
+    };
+    let block = framed(Color::DarkGray, title);
+    if app.scripts.preview().is_empty() {
+        return draw_placeholder(f, block, area, "Nothing to preview.");
+    }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let height = usize::from(inner.height);
+    let start = app
+        .scripts
+        .preview_scroll
+        .min(app.scripts.preview().len().saturating_sub(1));
+    let lines: Vec<Line> = app
+        .scripts
+        .preview()
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(height)
+        .map(|(index, text)| {
+            Line::from(vec![
+                Span::styled(format!("{:>4} ", index + 1), dim()),
+                Span::raw(text.clone()),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_log(f: &mut Frame, app: &App, area: Rect) {
+    let Some(script) = app.scripts.selected_script() else {
+        return;
+    };
+    let block = framed(Color::DarkGray, format!(" log · {} ", script.name));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let height = usize::from(inner.height);
+    let lines: Vec<&String> = script.log().collect();
+    if lines.is_empty() {
+        return f.render_widget(
+            Paragraph::new("No output yet. Space runs the script.").style(dim()),
+            inner,
+        );
+    }
+    let start = lines.len().saturating_sub(height);
+    let text = lines[start..]
+        .iter()
+        .map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    f.render_widget(Paragraph::new(text), inner);
 }

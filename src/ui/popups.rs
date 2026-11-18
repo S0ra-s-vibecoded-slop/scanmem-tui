@@ -1,17 +1,18 @@
 //! The process picker and the help screen.
 
 use super::framed;
-use crate::app::{App, Mode};
+use crate::app::{App, Confirm, Mode};
 use crate::keymap;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::Picker => draw_picker(f, app),
         Mode::Help => draw_help(f),
+        Mode::Confirm(confirm) => draw_confirm(f, app, confirm),
         Mode::Normal | Mode::Input(_) => {}
     }
 }
@@ -50,6 +51,38 @@ fn draw_help(f: &mut Frame) {
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(keymap::help_text()).block(framed(Color::Cyan, " Help ")),
+        area,
+    );
+}
+
+fn draw_confirm(f: &mut Frame, app: &App, confirm: Confirm) {
+    let area = centered(f.area(), 60, 30);
+    f.render_widget(Clear, area);
+    let message = match confirm {
+        Confirm::Delist(id) => {
+            let name = app
+                .scripts
+                .scripts()
+                .iter()
+                .find(|script| script.id == id)
+                .map_or_else(String::new, |script| script.name.clone());
+            format!("Remove `{name}` from the list?\nThe file stays on disk.")
+        }
+        Confirm::DeleteFile(id) => {
+            let path = app
+                .scripts
+                .scripts()
+                .iter()
+                .find(|script| script.id == id)
+                .map_or_else(String::new, |script| script.path.display().to_string());
+            format!("Delete {path} from disk?\nThis cannot be undone.")
+        }
+    };
+    let body = format!("{message}\n\n[y] yes     [n] no");
+    f.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .block(framed(Color::Yellow, " Confirm ")),
         area,
     );
 }

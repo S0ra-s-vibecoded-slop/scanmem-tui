@@ -1,6 +1,6 @@
 //! Key presses: which mode handles them, and what each normal-mode action does.
 
-use super::{App, Focus, InputKind, Level, Mode};
+use super::{App, Focus, InputKind, Level, Mode, Tab};
 use crate::keymap::{self, Action};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -20,13 +20,14 @@ impl App {
         match self.mode {
             Mode::Normal => self.on_normal_key(key),
             Mode::Input(kind) => self.on_input_key(kind, key),
+            Mode::Confirm(confirm) => self.on_confirm_key(confirm, key),
             Mode::Picker => self.on_picker_key(key),
             Mode::Help => self.mode = Mode::Normal,
         }
     }
 
     fn on_normal_key(&mut self, key: KeyEvent) {
-        if let Some(action) = keymap::action_for(key.code, self.focus) {
+        if let Some(action) = keymap::action_for(key.code, self.tab, self.focus) {
             self.perform(action);
         }
     }
@@ -38,11 +39,17 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Help => self.mode = Mode::Help,
-            Action::SwitchPane => self.switch_pane(),
+            Action::SwitchPane => {
+                if self.tab == Tab::Memory {
+                    self.switch_pane();
+                }
+            }
+            Action::SwitchToMemory => self.tab = Tab::Memory,
+            Action::SwitchToScripts => self.tab = Tab::Scripts,
             Action::MoveUp => self.move_selection(-1),
             Action::MoveDown => self.move_selection(1),
-            Action::MovePageUp => self.move_selection(-PAGE),
-            Action::MovePageDown => self.move_selection(PAGE),
+            Action::MovePageUp => self.page(-PAGE),
+            Action::MovePageDown => self.page(PAGE),
             Action::JumpToStart => self.move_selection(JUMP_TO_START),
             Action::JumpToEnd => self.move_selection(JUMP_TO_END),
             Action::PickProcess => self.open_picker(),
@@ -59,6 +66,13 @@ impl App {
             Action::ReorderUp => self.reorder_saved(-1),
             Action::ToggleFreeze => self.toggle_freeze(),
             Action::RemoveSaved => self.remove_selected(),
+            Action::ToggleScript => self.toggle_script(),
+            Action::EditScript => self.edit_script(),
+            Action::ImportScript => self.begin_input(InputKind::ImportScript, String::new()),
+            Action::NewScript => self.begin_input(InputKind::NewScript, String::new()),
+            Action::DelistScript => self.confirm_delist(),
+            Action::DeleteScriptFile => self.confirm_delete(),
+            Action::ReloadScript => self.reload_script(),
         }
     }
 
@@ -70,12 +84,25 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
+        if self.tab == Tab::Scripts {
+            self.scripts.move_selection(delta);
+            return;
+        }
         match self.focus {
             Focus::Results => {
                 self.results.move_selection(delta);
                 self.refresh_live(); // rows that just scrolled into view need values
             }
             Focus::Saved => self.saved.move_selection(delta),
+        }
+    }
+
+    /// PgUp/PgDn scroll the script preview, or move table selections in memory.
+    fn page(&mut self, delta: isize) {
+        if self.tab == Tab::Scripts {
+            self.scripts.scroll_preview(delta);
+        } else {
+            self.move_selection(delta);
         }
     }
 

@@ -3,7 +3,7 @@
 //! Key handling, the hint bar and the help popup are all generated from
 //! `BINDINGS`, so they cannot drift apart.
 
-use crate::app::Focus;
+use crate::app::{Focus, Tab};
 use ratatui::crossterm::event::KeyCode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +23,15 @@ pub enum Action {
     RemoveSaved,
     AddAddress,
     SwitchPane,
+    SwitchToMemory,
+    SwitchToScripts,
+    ToggleScript,
+    EditScript,
+    ImportScript,
+    NewScript,
+    DelistScript,
+    DeleteScriptFile,
+    ReloadScript,
     MoveUp,
     MoveDown,
     MovePageUp,
@@ -41,6 +50,21 @@ impl Action {
             Action::PickProcess | Action::StartScan | Action::NewScan | Action::CycleType
         )
     }
+
+    /// Some general-looking keys only make sense on one tab.
+    fn works_on(self, tab: Tab) -> bool {
+        match self {
+            Action::AddAddress | Action::SwitchPane => tab == Tab::Memory,
+            Action::ToggleScript
+            | Action::EditScript
+            | Action::ImportScript
+            | Action::NewScript
+            | Action::DelistScript
+            | Action::DeleteScriptFile
+            | Action::ReloadScript => tab == Tab::Scripts,
+            _ => true,
+        }
+    }
 }
 
 /// Which pane a binding belongs to; also the grouping of the help popup.
@@ -49,14 +73,16 @@ enum Section {
     Scanning,
     Results,
     Saved,
+    Scripts,
     General,
 }
 
 impl Section {
-    const ALL: [Section; 4] = [
+    const ALL: [Section; 5] = [
         Section::Scanning,
         Section::Results,
         Section::Saved,
+        Section::Scripts,
         Section::General,
     ];
 
@@ -65,23 +91,26 @@ impl Section {
             Section::Scanning => "Scanning",
             Section::Results => "Scan results",
             Section::Saved => "Saved addresses",
+            Section::Scripts => "Scripts",
             Section::General => "General",
         }
     }
 
-    fn works_in(self, focus: Focus) -> bool {
+    fn works_in(self, tab: Tab, focus: Focus) -> bool {
         match self {
-            Section::Results => focus == Focus::Results,
-            Section::Saved => focus == Focus::Saved,
-            Section::Scanning | Section::General => true,
+            Section::Results => tab == Tab::Memory && focus == Focus::Results,
+            Section::Saved => tab == Tab::Memory && focus == Focus::Saved,
+            Section::Scanning => tab == Tab::Memory,
+            Section::Scripts => tab == Tab::Scripts,
+            Section::General => true,
         }
     }
 
     /// Scanning keys work everywhere but are only advertised next to the results.
-    fn hinted_in(self, focus: Focus) -> bool {
+    fn hinted_in(self, tab: Tab, focus: Focus) -> bool {
         match self {
-            Section::Scanning => focus == Focus::Results,
-            _ => self.works_in(focus),
+            Section::Scanning => tab == Tab::Memory && focus == Focus::Results,
+            _ => self.works_in(tab, focus),
         }
     }
 }
@@ -161,12 +190,48 @@ static BINDINGS: &[Binding] = &[
         label: "d", hint: "d delete", help: "remove from the list",
     },
     Binding {
+        section: Scripts, action: ToggleScript, keys: &[ch(' ')],
+        label: "Space", hint: "Space run/stop", help: "start or stop the selected script (all scripts start off)",
+    },
+    Binding {
+        section: Scripts, action: EditScript, keys: &[KeyCode::Enter],
+        label: "Enter", hint: "Enter edit", help: "open the selected script in $EDITOR (vi when EDITOR is unset)",
+    },
+    Binding {
+        section: Scripts, action: ImportScript, keys: &[ch('i')],
+        label: "i", hint: "i import", help: "import a .lua file, or every .lua directly inside a folder",
+    },
+    Binding {
+        section: Scripts, action: NewScript, keys: &[ch('n')],
+        label: "n", hint: "n new", help: "create a script inside the scripts folder (a relative path, .lua added)",
+    },
+    Binding {
+        section: Scripts, action: DelistScript, keys: &[ch('d')],
+        label: "d", hint: "d delist", help: "remove the selected script from the list; the file stays on disk",
+    },
+    Binding {
+        section: Scripts, action: DeleteScriptFile, keys: &[ch('D')],
+        label: "D", hint: "D delete", help: "delete the selected script's file (only inside the scripts folder)",
+    },
+    Binding {
+        section: Scripts, action: ReloadScript, keys: &[ch('r')],
+        label: "r", hint: "r reload", help: "re-read the selected file from disk, restarting it when it is running",
+    },
+    Binding {
         section: General, action: AddAddress, keys: &[ch('A')],
         label: "A", hint: "A add addr", help: "add an address by hand: 7ffc8dc5328c int32, or `label+0x10` / `0xaddr-0x1140`",
     },
     Binding {
         section: General, action: SwitchPane, keys: &[KeyCode::Tab, KeyCode::BackTab],
-        label: "Tab", hint: "Tab pane", help: "switch pane",
+        label: "Tab", hint: "Tab pane", help: "switch pane (memory tab)",
+    },
+    Binding {
+        section: General, action: SwitchToMemory, keys: &[ch('1')],
+        label: "1 2", hint: "1/2 tab", help: "switch between the memory and scripts tabs",
+    },
+    Binding {
+        section: General, action: SwitchToScripts, keys: &[ch('2')],
+        label: "", hint: "", help: "",
     },
     Binding {
         section: General, action: MoveUp, keys: &[KeyCode::Up, ch('k')],
@@ -178,7 +243,7 @@ static BINDINGS: &[Binding] = &[
     },
     Binding {
         section: General, action: MovePageUp, keys: &[KeyCode::PageUp],
-        label: "PgUp PgDn", hint: "", help: "move by ten rows",
+        label: "PgUp PgDn", hint: "", help: "move by ten rows; scrolls the script preview on the scripts tab",
     },
     Binding {
         section: General, action: MovePageDown, keys: &[KeyCode::PageDown],
@@ -202,18 +267,26 @@ static BINDINGS: &[Binding] = &[
     },
 ];
 
-pub fn action_for(key: KeyCode, focus: Focus) -> Option<Action> {
+pub fn action_for(key: KeyCode, tab: Tab, focus: Focus) -> Option<Action> {
     BINDINGS
         .iter()
-        .find(|binding| binding.section.works_in(focus) && binding.keys.contains(&key))
+        .find(|binding| {
+            binding.section.works_in(tab, focus)
+                && binding.action.works_on(tab)
+                && binding.keys.contains(&key)
+        })
         .map(|binding| binding.action)
 }
 
 /// The one-line key summary under the panes.
-pub fn hint_line(focus: Focus) -> String {
+pub fn hint_line(tab: Tab, focus: Focus) -> String {
     BINDINGS
         .iter()
-        .filter(|binding| !binding.hint.is_empty() && binding.section.hinted_in(focus))
+        .filter(|binding| {
+            !binding.hint.is_empty()
+                && binding.action.works_on(tab)
+                && binding.section.hinted_in(tab, focus)
+        })
         .map(|binding| binding.hint)
         .collect::<Vec<_>>()
         .join("  ")
@@ -247,12 +320,17 @@ mod tests {
 
     #[test]
     fn no_key_is_bound_twice_within_a_pane() {
-        for focus in PANES {
-            let mut seen: Vec<KeyCode> = Vec::new();
-            for binding in BINDINGS.iter().filter(|b| b.section.works_in(focus)) {
-                for key in binding.keys {
-                    assert!(!seen.contains(key), "{key:?} is bound twice in {focus:?}");
-                    seen.push(*key);
+        for tab in [Tab::Memory, Tab::Scripts] {
+            for focus in PANES {
+                let mut seen: Vec<KeyCode> = Vec::new();
+                for binding in BINDINGS.iter().filter(|b| b.section.works_in(tab, focus)) {
+                    for key in binding.keys {
+                        assert!(
+                            !seen.contains(key),
+                            "{key:?} is bound twice in {tab:?}/{focus:?}"
+                        );
+                        seen.push(*key);
+                    }
                 }
             }
         }
@@ -260,23 +338,65 @@ mod tests {
 
     #[test]
     fn enter_depends_on_the_pane() {
-        assert_eq!(action_for(KeyCode::Enter, Focus::Results), Some(SaveResult));
-        assert_eq!(action_for(KeyCode::Enter, Focus::Saved), Some(SetValue));
+        assert_eq!(
+            action_for(KeyCode::Enter, Tab::Memory, Focus::Results),
+            Some(SaveResult)
+        );
+        assert_eq!(
+            action_for(KeyCode::Enter, Tab::Memory, Focus::Saved),
+            Some(SetValue)
+        );
+        assert_eq!(
+            action_for(KeyCode::Enter, Tab::Scripts, Focus::Results),
+            Some(EditScript)
+        );
     }
 
     #[test]
     fn pane_keys_stay_in_their_pane() {
-        assert_eq!(action_for(ch('w'), Focus::Results), None);
-        assert_eq!(action_for(ch('a'), Focus::Saved), None);
-        assert_eq!(action_for(ch(' '), Focus::Saved), Some(ToggleFreeze));
+        assert_eq!(action_for(ch('w'), Tab::Memory, Focus::Results), None);
+        assert_eq!(action_for(ch('a'), Tab::Memory, Focus::Saved), None);
+        assert_eq!(
+            action_for(ch(' '), Tab::Memory, Focus::Saved),
+            Some(ToggleFreeze)
+        );
     }
 
     #[test]
     fn scanning_keys_work_from_either_pane() {
         for focus in PANES {
-            assert_eq!(action_for(ch('s'), focus), Some(StartScan));
-            assert_eq!(action_for(ch('/'), focus), Some(StartScan));
-            assert_eq!(action_for(ch('q'), focus), Some(Quit));
+            assert_eq!(action_for(ch('s'), Tab::Memory, focus), Some(StartScan));
+            assert_eq!(action_for(ch('/'), Tab::Memory, focus), Some(StartScan));
+            assert_eq!(action_for(ch('q'), Tab::Memory, focus), Some(Quit));
+        }
+    }
+
+    #[test]
+    fn script_keys_only_work_on_the_scripts_tab() {
+        assert_eq!(
+            action_for(ch(' '), Tab::Scripts, Focus::Results),
+            Some(ToggleScript)
+        );
+        assert_eq!(action_for(ch('s'), Tab::Scripts, Focus::Results), None);
+        assert_eq!(action_for(ch('w'), Tab::Scripts, Focus::Results), None);
+        assert_eq!(
+            action_for(ch('i'), Tab::Scripts, Focus::Results),
+            Some(ImportScript)
+        );
+        assert_eq!(action_for(ch('i'), Tab::Memory, Focus::Results), None);
+    }
+
+    #[test]
+    fn tabs_are_switched_by_their_digits() {
+        for focus in PANES {
+            assert_eq!(
+                action_for(ch('1'), Tab::Scripts, focus),
+                Some(SwitchToMemory)
+            );
+            assert_eq!(
+                action_for(ch('2'), Tab::Memory, focus),
+                Some(SwitchToScripts)
+            );
         }
     }
 
@@ -289,14 +409,25 @@ mod tests {
 
     #[test]
     fn hint_bar_follows_the_focused_pane() {
-        let results = hint_line(Focus::Results);
+        let results = hint_line(Tab::Memory, Focus::Results);
         assert!(results.contains("s scan") && results.contains("a/Enter save"));
         assert!(!results.contains("Space freeze"));
 
-        let saved = hint_line(Focus::Saved);
+        let saved = hint_line(Tab::Memory, Focus::Saved);
         assert!(saved.contains("Space freeze") && saved.contains("w/Enter set value"));
         assert!(!saved.contains("s scan"));
         assert!(saved.ends_with("q quit"));
+    }
+
+    #[test]
+    fn script_hints_replace_memory_hints() {
+        let scripts = hint_line(Tab::Scripts, Focus::Results);
+        assert!(scripts.contains("Space run/stop"));
+        assert!(scripts.contains("i import"));
+        assert!(!scripts.contains("s scan"));
+        assert!(!scripts.contains("Space freeze"));
+        assert!(!scripts.contains("A add addr"));
+        assert!(!scripts.contains("Tab pane"));
     }
 
     #[test]
@@ -306,6 +437,7 @@ mod tests {
             assert!(help.contains(section.title()));
         }
         assert!(help.contains("pick the target process"));
+        assert!(help.contains("start or stop the selected script"));
         assert!(!help.contains("\n  \n"));
     }
 }

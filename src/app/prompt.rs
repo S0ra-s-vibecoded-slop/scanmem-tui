@@ -41,6 +41,8 @@ impl App {
             InputKind::SetValue(index) => self.write_saved(index, text),
             InputKind::EditType(index) => self.apply_saved_type(index, text),
             InputKind::AddAddr => self.submit_address(text),
+            InputKind::ImportScript => self.import_script(text),
+            InputKind::NewScript => self.create_script(text),
         }
     }
 
@@ -117,58 +119,8 @@ fn parse_address(
 /// Sums the terms of an address expression; labels resolve before hex, like
 /// `range` does.
 fn evaluate_expression(expr: &str, saved: &SavedList) -> Result<u64, String> {
-    // Labels and hex digits never contain `+` or `-`, so every operator
-    // separates two terms and carries that term's sign.
-    let mut total: i128 = 0;
-    let mut base_seen = false;
-    let mut positive = true;
-    let mut start = 0;
-    for (index, c) in expr.char_indices() {
-        if c != '+' && c != '-' {
-            continue;
-        }
-        total = add_term(total, &mut base_seen, positive, &expr[start..index], saved)?;
-        positive = c == '+';
-        start = index + 1;
-    }
-    total = add_term(total, &mut base_seen, positive, &expr[start..], saved)?;
-    if !(0..=i128::from(u64::MAX)).contains(&total) {
-        return Err(format!("{expr} does not fit in an address"));
-    }
-    #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    Ok(total as u64)
-}
-
-/// Adds one term: the first must be a label or hex address, the rest are
-/// offsets applied with the sign before them.
-fn add_term(
-    total: i128,
-    base_seen: &mut bool,
-    positive: bool,
-    token: &str,
-    saved: &SavedList,
-) -> Result<i128, String> {
-    if !*base_seen {
-        if !positive {
-            return Err(format!("`{token}` cannot start an address"));
-        }
-        *base_seen = true;
-        return Ok(i128::from(resolve_term(token, saved)?));
-    }
-    let Some(offset) = crate::datatype::parse_int(token) else {
-        return Err(format!("`{token}` is not a valid offset"));
-    };
-    Ok(total + if positive { offset } else { -offset })
-}
-
-/// A saved label wins over a hex reading of the word.
-fn resolve_term(term: &str, saved: &SavedList) -> Result<u64, String> {
-    if let Some(addr) = saved.labelled(term) {
-        return Ok(addr);
-    }
-    let digits = term.trim_start_matches("0x").trim_start_matches("0X");
-    u64::from_str_radix(digits, 16)
-        .map_err(|_| format!("`{term}` is neither a saved label nor a hex address"))
+    crate::address::resolve_expression(expr, |name| saved.labelled(name).map(|addr| (addr, None)))
+        .map(|resolved| resolved.addr)
 }
 
 #[cfg(test)]
