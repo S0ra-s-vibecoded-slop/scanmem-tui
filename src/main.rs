@@ -5,10 +5,12 @@
 mod address;
 mod app;
 mod args;
+mod code;
 mod datatype;
 mod freezer;
 mod gpu;
 mod keymap;
+mod maps;
 mod memio;
 mod scanmem;
 mod scanner;

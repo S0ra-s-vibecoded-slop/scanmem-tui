@@ -171,6 +171,8 @@ impl App {
         self.scan_range = None;
         self.candidates.clear();
         self.results.clear();
+        // A new address space invalidates every mapping and every label.
+        self.reset_code(Some(pid));
         self.refresh_live();
     }
 

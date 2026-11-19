@@ -3,6 +3,7 @@
 //! `jobs` talks to scanmem, `keys` and `prompt` turn key presses into actions,
 //! `results` and `saved` own the two tables, and `picker` is the process chooser.
 
+mod codetab;
 mod jobs;
 mod keys;
 mod picker;
@@ -23,6 +24,7 @@ use crate::scripts::paths::ScriptsRoot;
 use crate::scripts::store::Scripts;
 use crate::stats::Stats;
 use anyhow::{Context, Result};
+use codetab::{CodeView, XrefJob};
 use jobs::Job;
 use picker::Picker;
 use rangescan::RangeJob;
@@ -34,6 +36,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+pub use codetab::CodeFocus;
 pub use results::ResultRow;
 pub use saved::Saved;
 
@@ -44,6 +47,7 @@ const STATS_REFRESH: Duration = Duration::from_millis(1000);
 pub enum Tab {
     Memory,
     Scripts,
+    Code,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +90,10 @@ pub enum InputKind {
     ImportScript,
     /// Create a script inside the scripts folder from a relative path.
     NewScript,
+    /// Go to a label, `module+0x…` offset, or hex address in the Code tab.
+    GotoCode,
+    /// Find instructions that encode a label or address.
+    FindRefs,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,6 +131,8 @@ pub struct App {
     pub job: Option<Job>,
     /// The range scan running on its own thread, if any.
     pub range_job: Option<RangeJob>,
+    /// The reference scan running on its own thread, if any.
+    pub xref_job: Option<XrefJob>,
 
     pub freezer: Freezer,
     pub stats: Stats,
@@ -139,6 +149,7 @@ pub struct App {
 
     pub tab: Tab,
     pub scripts: Scripts,
+    pub code: CodeView,
     /// The Lua thread; UI talks to it through commands and events only.
     engine: Engine,
     /// Set when the event loop should hand the terminal to `$EDITOR`.
@@ -146,6 +157,8 @@ pub struct App {
 
     pub focus: Focus,
     pub mode: Mode,
+    /// First line shown in the help popup.
+    pub help_scroll: u16,
     pub input: String,
     pub status: Status,
     pub should_quit: bool,
@@ -179,6 +192,7 @@ impl App {
     pub fn tick(&mut self) {
         self.drain_backend_events();
         self.drain_range_job();
+        self.drain_xref_job();
         self.drain_script_events();
         self.refresh_live_values_if_due();
         self.refresh_stats_if_due();
@@ -195,7 +209,7 @@ impl App {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.job.is_some() || self.range_job.is_some()
+        self.job.is_some() || self.range_job.is_some() || self.xref_job.is_some()
     }
 
     fn new(
@@ -212,6 +226,7 @@ impl App {
             backend_dead: false,
             job: None,
             range_job: None,
+            xref_job: None,
             freezer,
             stats: Stats::new(),
             target: None,
@@ -223,10 +238,12 @@ impl App {
             picker: Picker::empty(),
             tab: Tab::Memory,
             scripts,
+            code: CodeView::new(),
             engine,
             editor_request: None,
             focus: Focus::Results,
             mode: Mode::Normal,
+            help_scroll: 0,
             input: String::new(),
             status: Status {
                 text: "Starting scanmem…".into(),
@@ -281,6 +298,7 @@ impl App {
     fn on_backend_exited(&mut self, last_lines: &[String]) {
         self.backend_dead = true;
         self.job = None;
+        self.reset_code(None);
         // The session is over as far as scanning goes: scripts stop with it.
         self.disable_all_scripts();
         self.engine.set_memory(None);
