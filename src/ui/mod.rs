@@ -1,5 +1,6 @@
 //! Rendering.
 
+mod code;
 mod panes;
 mod popups;
 
@@ -41,6 +42,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             panes::draw_saved(f, app, right);
         }
         Tab::Scripts => panes::draw_scripts(f, app, main),
+        Tab::Code => code::draw_code(f, app, main),
     }
     draw_bottom(f, app, bottom);
     draw_hints(f, app, hints);
@@ -111,6 +113,8 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         tab("1 Memory", app.tab == Tab::Memory),
         Span::raw(" "),
         tab("2 Scripts", app.tab == Tab::Scripts),
+        Span::raw(" "),
+        tab("3 Code", app.tab == Tab::Code),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -161,23 +165,35 @@ fn prompt_title(app: &App, kind: InputKind) -> String {
             " New script in {}: relative path, .lua added ",
             app.scripts.root.dir.display()
         ),
+        InputKind::GotoCode => {
+            " Go to: <label|module+0xoffset|hex address>  e.g. health, libc.so.6+0x2a000, 0x7f32 "
+                .to_string()
+        }
+        InputKind::FindRefs => {
+            " Find references to: <label|module+0xoffset|hex address> ".to_string()
+        }
     }
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let line = match (&app.job, &app.range_job) {
-        (Some(job), _) => spinner_line(
+    let line = match (&app.job, &app.range_job, &app.xref_job) {
+        (Some(job), _, _) => spinner_line(
             job.label,
             job.progress
                 .map(|(done, total)| format!("region {done}/{total}")),
             job.since,
         ),
-        (None, Some(range)) => spinner_line(
+        (None, Some(range), _) => spinner_line(
             range.label,
             range.percent().map(|percent| format!("{percent}%")),
             range.since,
         ),
-        (None, None) => Line::styled(
+        (None, None, Some(xref)) => spinner_line(
+            "Finding references",
+            xref.percent().map(|percent| format!("{percent}%")),
+            xref.since,
+        ),
+        (None, None, None) => Line::styled(
             app.status.text.clone(),
             Style::new().fg(level_color(app.status.level)),
         ),
@@ -215,7 +231,7 @@ fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
         Mode::Input(_) => "Enter confirm   Esc cancel   Ctrl-U clear".to_string(),
         Mode::Confirm(_) => "y confirm   n cancel".to_string(),
         Mode::Picker => "type to filter   ↑↓ choose   Enter attach   Esc cancel".to_string(),
-        Mode::Help => "any key to close".to_string(),
+        Mode::Help => "↑↓ scroll   any other key closes".to_string(),
         Mode::Normal => keymap::hint_line(app.tab, app.focus),
     };
     f.render_widget(

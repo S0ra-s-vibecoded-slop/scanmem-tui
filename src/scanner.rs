@@ -72,7 +72,7 @@ impl ScanControl {
         (self.done.load(Relaxed), self.total.load(Relaxed))
     }
 
-    fn add_done(&self, bytes: u64) {
+    pub(crate) fn add_done(&self, bytes: u64) {
         self.done.fetch_add(bytes, Relaxed);
     }
 }

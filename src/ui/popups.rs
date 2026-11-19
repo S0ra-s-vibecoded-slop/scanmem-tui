@@ -11,7 +11,7 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 pub fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::Picker => draw_picker(f, app),
-        Mode::Help => draw_help(f),
+        Mode::Help => draw_help(f, app),
         Mode::Confirm(confirm) => draw_confirm(f, app, confirm),
         Mode::Normal | Mode::Input(_) => {}
     }
@@ -46,13 +46,18 @@ fn draw_picker(f: &mut Frame, app: &mut App) {
     f.render_stateful_widget(widget, list, &mut app.picker.state);
 }
 
-fn draw_help(f: &mut Frame) {
+fn draw_help(f: &mut Frame, app: &mut App) {
     let area = centered(f.area(), 70, 85);
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(keymap::help_text()).block(framed(Color::Cyan, " Help ")),
-        area,
-    );
+    let block = framed(Color::Cyan, " Help ");
+    let inner = block.inner(area);
+    let text = keymap::help_text();
+    let lines = text.lines().count();
+    let hidden = lines.saturating_sub(usize::from(inner.height));
+    let scroll = usize::from(app.help_scroll).min(hidden);
+    app.help_scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(text).scroll((app.help_scroll, 0)), inner);
 }
 
 fn draw_confirm(f: &mut Frame, app: &App, confirm: Confirm) {
