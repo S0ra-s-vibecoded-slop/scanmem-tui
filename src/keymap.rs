@@ -159,7 +159,7 @@ use Section::*;
 static BINDINGS: &[Binding] = &[
     Binding {
         section: Scanning, action: PickProcess, keys: &[ch('p')],
-        label: "p", hint: "p process", help: "pick the target process",
+        label: "p", hint: "p process", help: "pick the target process, by name or pid",
     },
     Binding {
         section: Scanning, action: StartScan, keys: &[ch('s'), ch('/')],

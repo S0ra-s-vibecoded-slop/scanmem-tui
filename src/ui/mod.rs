@@ -230,7 +230,7 @@ fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
     let text = match app.mode {
         Mode::Input(_) => "Enter confirm   Esc cancel   Ctrl-U clear".to_string(),
         Mode::Confirm(_) => "y confirm   n cancel".to_string(),
-        Mode::Picker => "type to filter   ↑↓ choose   Enter attach   Esc cancel".to_string(),
+        Mode::Picker => "filter by name or pid   ↑↓ choose   Enter attach   Esc cancel".to_string(),
         Mode::Help => "↑↓ scroll   any other key closes".to_string(),
         Mode::Normal => keymap::hint_line(app.tab, app.focus),
     };
