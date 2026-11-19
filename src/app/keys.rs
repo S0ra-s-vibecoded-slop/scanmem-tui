@@ -74,6 +74,7 @@ impl App {
             }
             Action::OpenInCode => self.open_selected_in_code(),
             Action::FindRefs => self.begin_find_refs(),
+            Action::FindPointers => self.begin_find_pointers(),
             Action::GotoCode => self.begin_goto_code(),
             Action::CodeOpen => self.code_open(),
             Action::CodeBack => self.code_back(),
@@ -170,6 +171,11 @@ impl App {
     }
 
     fn stop_scan(&mut self) {
+        if let Some(job) = &self.pointer_job {
+            job.control.cancel();
+            self.say(Level::Info, "Stopping the pointer scan…");
+            return;
+        }
         if let Some(job) = &self.xref_job {
             job.control.cancel();
             self.say(Level::Info, "Stopping the reference scan…");

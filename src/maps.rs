@@ -93,6 +93,14 @@ impl Mapping {
         self.perms.exec && !self.is_empty()
     }
 
+    pub fn readable(&self) -> bool {
+        self.perms.read && !self.is_empty()
+    }
+
+    pub fn writable(&self) -> bool {
+        self.perms.write && !self.is_empty()
+    }
+
     pub fn file_path(&self) -> Option<&str> {
         self.path.as_deref().filter(|path| path.starts_with('/'))
     }

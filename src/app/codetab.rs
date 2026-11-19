@@ -5,12 +5,13 @@
 //! disassembly exists to give those hits somewhere to land.
 
 use super::{App, InputKind, Level, Tab};
-use crate::code::{self, DecodedLine, RefKind, Reference, Window};
+use crate::code::{self, AddrRange, DecodedLine, Pointer, RefKind, Reference, Window};
 use crate::maps::{self, Mapping};
 use crate::memio::MemIo;
 use crate::scanner::ScanControl;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
@@ -28,6 +29,55 @@ pub enum CodeFocus {
     Disassembly,
 }
 
+/// What the sidebar is listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sidebar {
+    Mappings,
+    Refs,
+    Pointers,
+}
+
+/// A small cache: inserting an existing key refreshes it, and the oldest
+/// entry is dropped beyond `CACHE_LIMIT`.
+struct Recent<K: Eq + Hash + Copy, V> {
+    map: HashMap<K, V>,
+    order: VecDeque<K>,
+}
+
+impl<K: Eq + Hash + Copy, V> Recent<K, V> {
+    fn new() -> Recent<K, V> {
+        Recent {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        self.order.retain(|other| *other != key);
+        self.order.push_back(key);
+        while self.order.len() > CACHE_LIMIT {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(key, value);
+    }
+
+    fn remove(&mut self, key: &K) {
+        self.map.remove(key);
+        self.order.retain(|other| other != key);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
 /// Everything the Code tab shows. Reset whenever the target changes.
 pub struct CodeView {
     pub pid: Option<u32>,
@@ -35,12 +85,18 @@ pub struct CodeView {
     pub mappings: Vec<Mapping>,
     /// Selection index into the executable mappings.
     pub selected_mapping: usize,
-    /// The sidebar shows the reference list instead of the mappings.
-    pub showing_refs: bool,
+    /// What the sidebar is listing.
+    pub sidebar: Sidebar,
     pub refs: Vec<Reference>,
     pub ref_state: ListState,
-    pub ref_target: Option<u64>,
+    pub ref_range: Option<AddrRange>,
     pub ref_label: Option<String>,
+    /// Where `Esc` returns from the reference list.
+    refs_return: Sidebar,
+    pub pointers: Vec<Pointer>,
+    pub pointer_state: ListState,
+    pub pointer_target: Option<u64>,
+    pub pointer_label: Option<String>,
     pub anchor: Option<u64>,
     pub lines: Vec<DecodedLine>,
     pub cursor: usize,
@@ -50,10 +106,10 @@ pub struct CodeView {
     pub focus: CodeFocus,
     /// (anchor, cursor) pairs, so `u` can retrace a jump.
     pub history: Vec<(u64, usize)>,
-    /// Finished scans per `(pid, target)`, so reopening is instant.
-    cache: HashMap<(u32, u64), Vec<Reference>>,
-    /// Insertion order of `cache`, oldest first.
-    cache_order: VecDeque<(u32, u64)>,
+    /// Finished scans per `(pid, range)`, so reopening is instant.
+    ref_cache: Recent<(u32, AddrRange), Vec<Reference>>,
+    /// Finished pointer scans per `(pid, target)`.
+    pointer_cache: Recent<(u32, u64), Vec<Pointer>>,
 }
 
 impl CodeView {
@@ -62,11 +118,16 @@ impl CodeView {
             pid: None,
             mappings: Vec::new(),
             selected_mapping: 0,
-            showing_refs: false,
+            sidebar: Sidebar::Mappings,
             refs: Vec::new(),
             ref_state: ListState::default(),
-            ref_target: None,
+            ref_range: None,
             ref_label: None,
+            refs_return: Sidebar::Mappings,
+            pointers: Vec::new(),
+            pointer_state: ListState::default(),
+            pointer_target: None,
+            pointer_label: None,
             anchor: None,
             lines: Vec::new(),
             cursor: 0,
@@ -75,8 +136,8 @@ impl CodeView {
             bytes: false,
             focus: CodeFocus::Sidebar,
             history: Vec::new(),
-            cache: HashMap::new(),
-            cache_order: VecDeque::new(),
+            ref_cache: Recent::new(),
+            pointer_cache: Recent::new(),
         }
     }
 
@@ -87,19 +148,24 @@ impl CodeView {
             .and_then(|pid| maps::read_maps(pid).ok())
             .unwrap_or_default();
         self.selected_mapping = 0;
-        self.showing_refs = false;
+        self.sidebar = Sidebar::Mappings;
         self.refs.clear();
         self.ref_state.select(None);
-        self.ref_target = None;
+        self.ref_range = None;
         self.ref_label = None;
+        self.refs_return = Sidebar::Mappings;
+        self.pointers.clear();
+        self.pointer_state.select(None);
+        self.pointer_target = None;
+        self.pointer_label = None;
         self.anchor = None;
         self.lines.clear();
         self.cursor = 0;
         self.scroll = 0;
         self.focus = CodeFocus::Sidebar;
         self.history.clear();
-        self.cache.clear();
-        self.cache_order.clear();
+        self.ref_cache.clear();
+        self.pointer_cache.clear();
     }
 
     /// Retries a failed maps read for the same process (permissions, or a
@@ -128,31 +194,45 @@ impl CodeView {
             .and_then(|index| self.refs.get(index))
     }
 
-    pub fn cached(&self, target: u64) -> Option<&[Reference]> {
-        let pid = self.pid?;
-        self.cache.get(&(pid, target)).map(Vec::as_slice)
+    pub fn selected_pointer(&self) -> Option<&Pointer> {
+        self.pointer_state
+            .selected()
+            .and_then(|index| self.pointers.get(index))
     }
 
-    pub fn remember_refs(&mut self, target: u64, refs: Vec<Reference>) -> Vec<Reference> {
+    pub fn cached_refs(&self, range: AddrRange) -> Option<&[Reference]> {
+        let pid = self.pid?;
+        self.ref_cache.get(&(pid, range)).map(Vec::as_slice)
+    }
+
+    pub fn remember_refs(&mut self, range: AddrRange, refs: Vec<Reference>) -> Vec<Reference> {
         if let Some(pid) = self.pid {
-            let key = (pid, target);
-            self.cache_order.retain(|other| *other != key);
-            self.cache_order.push_back(key);
-            while self.cache_order.len() > CACHE_LIMIT {
-                if let Some(old) = self.cache_order.pop_front() {
-                    self.cache.remove(&old);
-                }
-            }
-            self.cache.insert(key, refs.clone());
+            self.ref_cache.insert((pid, range), refs.clone());
         }
         refs
     }
 
-    pub fn forget_refs(&mut self, target: u64) {
+    pub fn forget_refs(&mut self, range: AddrRange) {
         if let Some(pid) = self.pid {
-            let key = (pid, target);
-            self.cache.remove(&key);
-            self.cache_order.retain(|other| *other != key);
+            self.ref_cache.remove(&(pid, range));
+        }
+    }
+
+    pub fn cached_pointers(&self, target: u64) -> Option<&[Pointer]> {
+        let pid = self.pid?;
+        self.pointer_cache.get(&(pid, target)).map(Vec::as_slice)
+    }
+
+    pub fn remember_pointers(&mut self, target: u64, pointers: Vec<Pointer>) -> Vec<Pointer> {
+        if let Some(pid) = self.pid {
+            self.pointer_cache.insert((pid, target), pointers.clone());
+        }
+        pointers
+    }
+
+    pub fn forget_pointers(&mut self, target: u64) {
+        if let Some(pid) = self.pid {
+            self.pointer_cache.remove(&(pid, target));
         }
     }
 
@@ -198,16 +278,20 @@ impl CodeView {
         self.selected_mapping = current.saturating_add(delta).clamp(0, max).cast_unsigned();
     }
 
-    pub fn move_ref(&mut self, delta: isize) {
-        let count = self.refs.len();
+    pub fn move_sidebar(&mut self, delta: isize) {
+        let (state, count) = match self.sidebar {
+            Sidebar::Mappings => return self.move_mapping(delta),
+            Sidebar::Refs => (&mut self.ref_state, self.refs.len()),
+            Sidebar::Pointers => (&mut self.pointer_state, self.pointers.len()),
+        };
         if count == 0 {
-            self.ref_state.select(None);
+            state.select(None);
             return;
         }
-        let current = self.ref_state.selected().unwrap_or(0).cast_signed();
+        let current = state.selected().unwrap_or(0).cast_signed();
         let max = count.cast_signed() - 1;
         let next = current.saturating_add(delta).clamp(0, max).cast_unsigned();
-        self.ref_state.select(Some(next));
+        state.select(Some(next));
     }
 }
 
@@ -215,8 +299,10 @@ impl CodeView {
 pub struct XrefJob {
     pub control: Arc<ScanControl>,
     rx: Receiver<XrefOutcome>,
-    pub target: u64,
+    pub range: AddrRange,
     pub label: Option<String>,
+    /// Where the finished list should return to on Esc.
+    ret: Sidebar,
     pub since: Instant,
 }
 
@@ -233,10 +319,35 @@ enum XrefOutcome {
     Failed(String),
 }
 
+/// A pointer scan running on its own thread.
+pub struct PointerJob {
+    pub control: Arc<ScanControl>,
+    rx: Receiver<PointerOutcome>,
+    pub target: u64,
+    pub label: Option<String>,
+    pub since: Instant,
+}
+
+impl PointerJob {
+    /// Progress as a percentage, when the total is known.
+    pub fn percent(&self) -> Option<u64> {
+        let (done, total) = self.control.progress();
+        (total > 0).then(|| (done * 100 / total).min(100))
+    }
+}
+
+enum PointerOutcome {
+    Done(Vec<Pointer>),
+    Failed(String),
+}
+
 impl App {
     /// Keeps the Code tab's maps in step with the target.
     pub(super) fn reset_code(&mut self, pid: Option<u32>) {
         if let Some(job) = self.xref_job.take() {
+            job.control.cancel();
+        }
+        if let Some(job) = self.pointer_job.take() {
             job.control.cancel();
         }
         self.code.reset(pid);
@@ -359,14 +470,14 @@ impl App {
         ))
     }
 
-    /// `f`: find instructions that encode an address.
+    /// `f`: find instructions that encode an address or a range of them.
     pub(super) fn begin_find_refs(&mut self) {
         if self.tab == Tab::Code {
             self.ensure_code();
             let initial = self
                 .code
-                .ref_target
-                .map_or_else(String::new, |addr| format!("0x{addr:x}"));
+                .ref_range
+                .map_or_else(String::new, |range| range.to_string());
             return self.begin_input(InputKind::FindRefs, initial);
         }
         let Some(index) = self.saved.selected() else {
@@ -382,6 +493,35 @@ impl App {
     }
 
     pub(super) fn submit_find_refs(&mut self, text: &str) {
+        match self.resolve_code_range(text) {
+            Ok(range) => {
+                let label = if range.is_single() {
+                    self.saved
+                        .items
+                        .iter()
+                        .find(|item| item.addr == range.lo && !item.label.is_empty())
+                        .map(|item| item.label.clone())
+                } else {
+                    None
+                };
+                self.find_refs_in(range, label, Sidebar::Mappings);
+            }
+            Err(reason) => self.say(Level::Error, reason),
+        }
+    }
+
+    /// `P`: find memory slots that hold a pointer to an address.
+    pub(super) fn begin_find_pointers(&mut self) {
+        self.ensure_code();
+        let cursor = self.code.lines.get(self.code.cursor).map(|line| line.addr);
+        let initial = cursor
+            .or(self.code.pointer_target)
+            .or(self.code.anchor)
+            .map_or_else(String::new, |addr| format!("0x{addr:x}"));
+        self.begin_input(InputKind::FindPointers, initial);
+    }
+
+    pub(super) fn submit_find_pointers(&mut self, text: &str) {
         match self.resolve_code_address(text) {
             Ok(addr) => {
                 let label = self
@@ -390,20 +530,41 @@ impl App {
                     .iter()
                     .find(|item| item.addr == addr && !item.label.is_empty())
                     .map(|item| item.label.clone());
-                self.find_refs(addr, label);
+                self.find_pointers(addr, label);
             }
             Err(reason) => self.say(Level::Error, reason),
         }
     }
 
+    /// An address, or `a..b`, where each end may be a label, `module+0x…`
+    /// offset, or hex address.
+    fn resolve_code_range(&self, text: &str) -> Result<AddrRange, String> {
+        if let Some((lo, hi)) = text.split_once("..") {
+            let lo = self.resolve_code_address(lo.trim())?;
+            let hi = self.resolve_code_address(hi.trim())?;
+            return Ok(AddrRange::span(lo, hi));
+        }
+        Ok(AddrRange::one(self.resolve_code_address(text)?))
+    }
+
     /// The scan itself: all executable mappings, on a worker thread.
     pub(super) fn find_refs(&mut self, target: u64, label: Option<String>) {
+        self.find_refs_in(AddrRange::one(target), label, Sidebar::Mappings);
+    }
+
+    fn find_refs_in(&mut self, range: AddrRange, label: Option<String>, ret: Sidebar) {
         self.ensure_code();
         self.tab = Tab::Code;
         if self.xref_job.is_some() {
             return self.say(
                 Level::Warn,
                 "A reference scan is already running (Esc stops it)",
+            );
+        }
+        if self.pointer_job.is_some() {
+            return self.say(
+                Level::Warn,
+                "A pointer scan is already running (Esc stops it)",
             );
         }
         if self.job.is_some() || self.range_job.is_some() {
@@ -418,14 +579,11 @@ impl App {
                 "No executable mappings to scan (is the process still alive?)",
             );
         }
-        if let Some(refs) = self.code.cached(target) {
+        if let Some(refs) = self.code.cached_refs(range) {
             let refs = refs.to_vec();
             let count = refs.len();
-            let what = label.clone().map_or_else(
-                || format!("0x{target:x}"),
-                |label| format!("`{label}` (0x{target:x})"),
-            );
-            self.show_refs(target, label, refs);
+            let what = what(range, label.clone());
+            self.show_refs(range, label, refs, ret);
             return self.say(
                 Level::Info,
                 format!("{count} reference(s) to {what}, from the last scan"),
@@ -438,7 +596,7 @@ impl App {
         let spawned = thread::Builder::new()
             .name("xref-scan".into())
             .spawn(move || {
-                run_xref(pid, &mappings, target, &thread_control, &tx);
+                run_xref(pid, &mappings, range, &thread_control, &tx);
             });
         match spawned {
             Ok(_) => {}
@@ -449,11 +607,79 @@ impl App {
                 );
             }
         }
-        let what = label.clone().map_or_else(
-            || format!("0x{target:x}"),
-            |label| format!("`{label}` (0x{target:x})"),
-        );
+        let described = what(range, label.clone());
         self.xref_job = Some(XrefJob {
+            control,
+            rx,
+            range,
+            label,
+            ret,
+            since: Instant::now(),
+        });
+        self.say(
+            Level::Info,
+            format!("Searching executable memory for {described}…"),
+        );
+    }
+
+    /// Finds pointers to `target` in every readable mapping, on a worker thread.
+    pub(super) fn find_pointers(&mut self, target: u64, label: Option<String>) {
+        self.ensure_code();
+        self.tab = Tab::Code;
+        if self.pointer_job.is_some() {
+            return self.say(
+                Level::Warn,
+                "A pointer scan is already running (Esc stops it)",
+            );
+        }
+        if self.xref_job.is_some() {
+            return self.say(
+                Level::Warn,
+                "A reference scan is already running (Esc stops it)",
+            );
+        }
+        if self.job.is_some() || self.range_job.is_some() {
+            return self.say(Level::Warn, "scanmem is busy");
+        }
+        let Some(pid) = self.target.as_ref().map(|target| target.pid) else {
+            return self.say(Level::Warn, "Pick a process first (p)");
+        };
+        if self.code.mappings.is_empty() {
+            return self.say(
+                Level::Warn,
+                "No mappings to scan (is the process still alive?)",
+            );
+        }
+        if let Some(pointers) = self.code.cached_pointers(target) {
+            let pointers = pointers.to_vec();
+            let count = pointers.len();
+            let what = what(AddrRange::one(target), label.clone());
+            self.show_pointers(target, label, pointers);
+            return self.say(
+                Level::Info,
+                format!("{count} pointer(s) to {what}, from the last scan"),
+            );
+        }
+        let mappings = self.code.mappings.clone();
+        let control = Arc::new(ScanControl::new());
+        let (tx, rx) = channel();
+        let thread_control = control.clone();
+        let spawned = thread::Builder::new()
+            .name("pointer-scan".into())
+            .spawn(move || {
+                run_pointers(pid, &mappings, target, &thread_control, &tx);
+            });
+        match spawned {
+            Ok(_) => {}
+            Err(reason) => {
+                return self.say(
+                    Level::Error,
+                    format!("could not start the pointer scan: {reason}"),
+                );
+            }
+        }
+        let described = what(AddrRange::one(target), label.clone());
+        self.pointer_job = Some(PointerJob {
             control,
             rx,
             target,
@@ -462,7 +688,7 @@ impl App {
         });
         self.say(
             Level::Info,
-            format!("Searching executable memory for {what}…"),
+            format!("Searching readable memory for pointers to {described}…"),
         );
     }
 
@@ -488,56 +714,129 @@ impl App {
         }
         match outcome {
             XrefOutcome::Done(refs) => {
-                let refs = self.code.remember_refs(job.target, refs);
-                self.show_refs(job.target, job.label, refs);
+                let refs = self.code.remember_refs(job.range, refs);
+                self.show_refs(job.range, job.label, refs, job.ret);
             }
             XrefOutcome::Failed(reason) => self.say(Level::Error, reason),
         }
     }
 
-    fn show_refs(&mut self, target: u64, label: Option<String>, refs: Vec<Reference>) {
-        self.tab = Tab::Code;
-        let count = refs.len();
-        self.code.showing_refs = true;
-        self.code.refs = refs;
-        self.code.ref_target = Some(target);
-        self.code.ref_label = label;
-        self.code.ref_state.select((count > 0).then_some(0));
-        self.code.focus = CodeFocus::Sidebar;
-        let what = self.code.ref_label.clone().map_or_else(
-            || format!("0x{target:x}"),
-            |label| format!("`{label}` (0x{target:x})"),
-        );
-        if count == 0 {
-            let hint = match maps::mapping_at(&self.code.mappings, target) {
-                Some(mapping) if !mapping.executable() => {
-                    "Static scans only see addresses encoded in instructions; values reached through pointers (heap, stack) usually have none."
+    /// Picks up a finished pointer scan, or reports that it was stopped.
+    pub(super) fn drain_pointer_job(&mut self) {
+        let outcome = match &self.pointer_job {
+            None => return,
+            Some(job) => match job.rx.try_recv() {
+                Ok(outcome) => outcome,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.pointer_job = None;
+                    return self.say(Level::Error, "The pointer scan ended unexpectedly.");
                 }
-                _ => "No instruction encodes that address.",
-            };
-            self.say(Level::Warn, format!("No references to {what}. {hint}"));
-        } else {
-            self.say(Level::Ok, format!("{count} reference(s) to {what}"));
+            },
+        };
+        let Some(job) = self.pointer_job.take() else {
+            return;
+        };
+        self.redraw = true;
+        if job.control.cancelled() {
+            return self.say(Level::Warn, "Pointer scan stopped.");
+        }
+        match outcome {
+            PointerOutcome::Done(pointers) => {
+                let pointers = self.code.remember_pointers(job.target, pointers);
+                self.show_pointers(job.target, job.label, pointers);
+            }
+            PointerOutcome::Failed(reason) => self.say(Level::Error, reason),
         }
     }
 
-    /// `r` on the reference list: run the same search again.
+    fn show_refs(
+        &mut self,
+        range: AddrRange,
+        label: Option<String>,
+        refs: Vec<Reference>,
+        ret: Sidebar,
+    ) {
+        self.tab = Tab::Code;
+        let count = refs.len();
+        self.code.sidebar = Sidebar::Refs;
+        self.code.refs = refs;
+        self.code.ref_range = Some(range);
+        self.code.ref_label = label;
+        self.code.refs_return = ret;
+        self.code.ref_state.select((count > 0).then_some(0));
+        self.code.focus = CodeFocus::Sidebar;
+        let described = what(range, self.code.ref_label.clone());
+        if count == 0 {
+            let hint = if range.is_single() {
+                match maps::mapping_at(&self.code.mappings, range.lo) {
+                    Some(mapping) if !mapping.executable() => {
+                        "Static scans only see addresses encoded in instructions; values reached through pointers (heap, stack) usually have none."
+                    }
+                    _ => "No instruction encodes that address.",
+                }
+            } else {
+                "No instruction encodes an address in that range."
+            };
+            self.say(Level::Warn, format!("No references to {described}. {hint}"));
+        } else {
+            self.say(Level::Ok, format!("{count} reference(s) to {described}"));
+        }
+    }
+
+    fn show_pointers(&mut self, target: u64, label: Option<String>, pointers: Vec<Pointer>) {
+        self.tab = Tab::Code;
+        let count = pointers.len();
+        self.code.sidebar = Sidebar::Pointers;
+        self.code.pointers = pointers;
+        self.code.pointer_target = Some(target);
+        self.code.pointer_label = label;
+        self.code.pointer_state.select((count > 0).then_some(0));
+        self.code.focus = CodeFocus::Sidebar;
+        let described = what(AddrRange::one(target), self.code.pointer_label.clone());
+        if count == 0 {
+            self.say(
+                Level::Warn,
+                format!(
+                    "No stored pointers to {described}. The access may be computed from a base register, or the pointer may live in a register or another object."
+                ),
+            );
+        } else {
+            self.say(
+                Level::Ok,
+                format!("{count} pointer slot(s) near {described}"),
+            );
+        }
+    }
+
+    /// `r` on the reference or pointer list: run the same search again.
     pub(super) fn rescan_refs(&mut self) {
-        let Some(target) = self.code.ref_target else {
+        if self.code.sidebar == Sidebar::Pointers {
+            let Some(target) = self.code.pointer_target else {
+                return self.say(Level::Info, "Press P to search for pointers first.");
+            };
+            if self.pointer_job.is_some() {
+                return self.say(Level::Warn, "A pointer scan is already running");
+            }
+            let label = self.code.pointer_label.clone();
+            self.code.forget_pointers(target);
+            return self.find_pointers(target, label);
+        }
+        let Some(range) = self.code.ref_range else {
             return self.say(Level::Info, "Press f to search for references first.");
         };
-        if !self.code.showing_refs {
+        if self.code.sidebar != Sidebar::Refs {
             return self.say(Level::Info, "Press f to search for references first.");
         }
         if self.xref_job.is_some() {
             return self.say(Level::Warn, "A reference scan is already running");
         }
         let label = self.code.ref_label.clone();
-        self.code.forget_refs(target);
-        self.find_refs(target, label);
+        self.code.forget_refs(range);
+        self.find_refs_in(range, label, self.code.refs_return);
     }
 
-    /// Enter on a mapping, a reference, or a branch.
+    /// Enter on a mapping, a reference, a pointer slot, or a branch.
     pub(super) fn code_open(&mut self) {
         if self.code.focus == CodeFocus::Disassembly {
             let Some(line) = self.code.lines.get(self.code.cursor) else {
@@ -554,17 +853,28 @@ impl App {
                 None => self.say(Level::Info, "This instruction has no direct target."),
             };
         }
-        if self.code.showing_refs {
-            let Some(reference) = self.code.selected_ref() else {
-                return self.say(Level::Info, "No references to open.");
-            };
-            let addr = reference.addr;
-            self.jump_code(addr, false);
-        } else if let Some(mapping) = self.code.selected_mapping() {
-            let start = mapping.start;
-            self.jump_code(start, false);
-        } else {
-            self.say(Level::Info, "No executable mappings.");
+        match self.code.sidebar {
+            Sidebar::Refs => {
+                let Some(reference) = self.code.selected_ref() else {
+                    return self.say(Level::Info, "No references to open.");
+                };
+                let addr = reference.addr;
+                self.jump_code(addr, false);
+            }
+            Sidebar::Pointers => {
+                let Some(slot) = self.code.selected_pointer().map(|pointer| pointer.slot) else {
+                    return self.say(Level::Info, "No pointer slots to open.");
+                };
+                self.find_refs_in(AddrRange::one(slot), None, Sidebar::Pointers);
+            }
+            Sidebar::Mappings => {
+                if let Some(mapping) = self.code.selected_mapping() {
+                    let start = mapping.start;
+                    self.jump_code(start, false);
+                } else {
+                    self.say(Level::Info, "No executable mappings.");
+                }
+            }
         }
     }
 
@@ -577,21 +887,30 @@ impl App {
             }
             return;
         }
-        // A jump from the reference list returns to that list first.
-        if self.code.showing_refs && self.code.focus == CodeFocus::Disassembly {
-            self.code.focus = CodeFocus::Sidebar;
-            return;
+        match self.code.sidebar {
+            Sidebar::Mappings => self.code.focus = CodeFocus::Sidebar,
+            // A jump from a list returns to that list first.
+            Sidebar::Refs | Sidebar::Pointers if self.code.focus == CodeFocus::Disassembly => {
+                self.code.focus = CodeFocus::Sidebar;
+            }
+            Sidebar::Refs => {
+                self.code.sidebar = self.code.refs_return;
+                self.code.focus = CodeFocus::Sidebar;
+            }
+            Sidebar::Pointers => {
+                self.code.sidebar = Sidebar::Mappings;
+                self.code.focus = CodeFocus::Sidebar;
+            }
         }
-        if self.code.showing_refs {
-            self.code.showing_refs = false;
-            self.code.focus = CodeFocus::Sidebar;
-            return;
-        }
-        self.code.focus = CodeFocus::Sidebar;
     }
 
     /// Esc on the Code tab: stop a scan, then step back.
     pub(super) fn code_cancel(&mut self) {
+        if let Some(job) = &self.pointer_job {
+            job.control.cancel();
+            self.say(Level::Info, "Stopping the pointer scan…");
+            return;
+        }
         if let Some(job) = &self.xref_job {
             job.control.cancel();
             self.say(Level::Info, "Stopping the reference scan…");
@@ -607,8 +926,7 @@ impl App {
     pub(super) fn code_move(&mut self, delta: isize) {
         match self.code.focus {
             CodeFocus::Disassembly => self.code.move_cursor(delta),
-            CodeFocus::Sidebar if self.code.showing_refs => self.code.move_ref(delta),
-            CodeFocus::Sidebar => self.code.move_mapping(delta),
+            CodeFocus::Sidebar => self.code.move_sidebar(delta),
         }
     }
 
@@ -635,17 +953,39 @@ impl App {
     }
 }
 
+/// `label` with its address, or just the address/range.
+fn what(range: AddrRange, label: Option<String>) -> String {
+    label.map_or_else(|| range.to_string(), |label| format!("`{label}` ({range})"))
+}
+
 /// The scan thread's body: opens its own memory handle, scans, reports back.
 fn run_xref(
     pid: u32,
     mappings: &[Mapping],
-    target: u64,
+    range: AddrRange,
     control: &ScanControl,
     tx: &Sender<XrefOutcome>,
 ) {
     let outcome = match MemIo::open(pid) {
-        Ok(memory) => XrefOutcome::Done(code::scan(&memory, mappings, target, control)),
+        Ok(memory) => XrefOutcome::Done(code::scan(&memory, mappings, range, control)),
         Err(reason) => XrefOutcome::Failed(format!(
+            "cannot open /proc/{pid}/mem: {reason} (try running as root)"
+        )),
+    };
+    let _ = tx.send(outcome);
+}
+
+/// The pointer scan's thread body, with the same memory-handle rules.
+fn run_pointers(
+    pid: u32,
+    mappings: &[Mapping],
+    target: u64,
+    control: &ScanControl,
+    tx: &Sender<PointerOutcome>,
+) {
+    let outcome = match MemIo::open(pid) {
+        Ok(memory) => PointerOutcome::Done(code::scan_pointers(&memory, mappings, target, control)),
+        Err(reason) => PointerOutcome::Failed(format!(
             "cannot open /proc/{pid}/mem: {reason} (try running as root)"
         )),
     };
@@ -694,16 +1034,31 @@ mod tests {
     }
 
     #[test]
-    fn the_scan_cache_is_cleared_with_the_target() {
+    fn the_scan_caches_are_cleared_with_the_target() {
         let mut view = CodeView::new();
         view.pid = Some(1);
-        view.remember_refs(0x1000, Vec::new());
-        assert!(view.cached(0x1000).is_some());
-        view.forget_refs(0x1000);
-        assert!(view.cached(0x1000).is_none());
-        view.remember_refs(0x2000, Vec::new());
-        view.reset(None);
-        assert!(view.cached(0x2000).is_none());
+        let range = AddrRange::one(0x1000);
+        view.remember_refs(range, Vec::new());
+        assert!(view.cached_refs(range).is_some());
+        view.forget_refs(range);
+        assert!(view.cached_refs(range).is_none());
+
+        view.remember_pointers(0x1000, Vec::new());
+        view.remember_refs(range, Vec::new());
+        view.reset(Some(1));
+        assert!(view.cached_refs(range).is_none());
+        assert!(view.cached_pointers(0x1000).is_none());
+    }
+
+    #[test]
+    fn a_cache_keeps_only_the_newest_entries() {
+        let newest = u64::try_from(CACHE_LIMIT).unwrap() + 1;
+        let mut cache: Recent<(u32, u64), u64> = Recent::new();
+        for target in 0..=newest {
+            cache.insert((1, target), target);
+        }
+        assert!(cache.get(&(1, 0)).is_none());
+        assert_eq!(cache.get(&(1, newest)), Some(&newest));
     }
 
     #[test]

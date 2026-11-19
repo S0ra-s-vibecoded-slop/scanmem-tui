@@ -30,6 +30,12 @@ const WINDOW_LINES: usize = 800;
 const SCAN_CHUNK: usize = 1024 * 1024;
 /// How many references the scan keeps.
 pub const XREF_MAX_RESULTS: usize = 5000;
+/// How far below the target a stored pointer may point and still be listed:
+/// a pointer to a struct is usually the struct's base, while the labelled
+/// address sits somewhere inside it.
+pub const POINTER_WINDOW: u64 = 0x1000;
+/// How many pointer slots the scan keeps.
+pub const POINTER_MAX_RESULTS: usize = 5000;
 /// Byte written for unreadable pages.
 const UNREADABLE: u8 = 0xcc;
 
@@ -274,6 +280,52 @@ pub enum RefKind {
     Immediate,
 }
 
+/// One address, or an inclusive span of addresses to look for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AddrRange {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+impl AddrRange {
+    pub const fn one(addr: u64) -> AddrRange {
+        AddrRange { lo: addr, hi: addr }
+    }
+
+    /// Accepts the ends in either order.
+    pub const fn span(lo: u64, hi: u64) -> AddrRange {
+        if lo <= hi {
+            AddrRange { lo, hi }
+        } else {
+            AddrRange { lo: hi, hi: lo }
+        }
+    }
+
+    pub fn contains(self, value: u64) -> bool {
+        self.lo <= value && value <= self.hi
+    }
+
+    pub fn is_single(self) -> bool {
+        self.lo == self.hi
+    }
+}
+
+impl Default for AddrRange {
+    fn default() -> AddrRange {
+        AddrRange::one(0)
+    }
+}
+
+impl std::fmt::Display for AddrRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_single() {
+            write!(f, "0x{:x}", self.lo)
+        } else {
+            write!(f, "0x{:x}..0x{:x}", self.lo, self.hi)
+        }
+    }
+}
+
 /// One instruction that mentions an address.
 #[derive(Clone, Debug)]
 pub struct Reference {
@@ -282,14 +334,23 @@ pub struct Reference {
     pub kind: RefKind,
 }
 
-/// Scans every executable mapping for instructions encoding `target`.
+/// A memory slot holding a pointer into the scanned object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pointer {
+    pub slot: u64,
+    /// The address stored in the slot; `target - POINTER_WINDOW` to `target`.
+    pub value: u64,
+}
+
+/// Scans every executable mapping for instructions encoding `targets`.
 ///
 /// This is a *static* scan: it sees operands and immediates, so heap
-/// addresses reached through pointers will usually have no hits.
+/// addresses reached through pointers will usually have no hits. A span
+/// catches accesses to a struct's base when the labelled address is a field.
 pub fn scan(
     reader: &dyn ReadBytes,
     mappings: &[Mapping],
-    target: u64,
+    targets: AddrRange,
     control: &ScanControl,
 ) -> Vec<Reference> {
     let executable: Vec<&Mapping> = mappings
@@ -304,7 +365,7 @@ pub fn scan(
             if control.cancelled() {
                 Vec::new()
             } else {
-                scan_mapping(reader, mapping, target, control)
+                scan_mapping(reader, mapping, targets, control)
             }
         })
         .collect();
@@ -315,10 +376,50 @@ pub fn scan(
     found
 }
 
+/// Scans writable memory for 8-byte slots holding a pointer to the target,
+/// or to up to `POINTER_WINDOW` bytes before it (a struct's base).
+///
+/// Pointers are stored data, not operands: this is the way to reach objects
+/// whose address no instruction encodes. Read-only mappings are skipped:
+/// a live pointer is written by the process, so it lives in writable memory.
+/// A pointer that only exists in a register cannot be found this way.
+pub fn scan_pointers(
+    reader: &dyn ReadBytes,
+    mappings: &[Mapping],
+    target: u64,
+    control: &ScanControl,
+) -> Vec<Pointer> {
+    let lo = target.saturating_sub(POINTER_WINDOW);
+    let writable: Vec<&Mapping> = mappings
+        .iter()
+        .filter(|mapping| mapping.readable() && mapping.writable())
+        .collect();
+    let total = writable.iter().map(|mapping| mapping.len()).sum();
+    control.set_total(total);
+    let per_mapping: Vec<Vec<Pointer>> = writable
+        .par_iter()
+        .map(|mapping| {
+            if control.cancelled() {
+                Vec::new()
+            } else {
+                scan_mapping_pointers(reader, mapping, lo, target, control)
+            }
+        })
+        .collect();
+    let mut found: Vec<Pointer> = per_mapping.into_iter().flatten().collect();
+    found.sort_by_key(|pointer| pointer.slot);
+    found.dedup_by_key(|pointer| pointer.slot);
+    // Exact pointers first, then the closest interior ones: anything else in
+    // the window (a link_map, a stack copy of a module base) is noise.
+    found.sort_by_key(|pointer| (target - pointer.value, pointer.slot));
+    found.truncate(POINTER_MAX_RESULTS);
+    found
+}
+
 fn scan_mapping(
     reader: &dyn ReadBytes,
     mapping: &Mapping,
-    target: u64,
+    targets: AddrRange,
     control: &ScanControl,
 ) -> Vec<Reference> {
     let mut found = Vec::new();
@@ -350,7 +451,7 @@ fn scan_mapping(
                 return found;
             }
             let instr = decoder.decode();
-            if let Some(kind) = reference_kind(&instr, target) {
+            if let Some(kind) = reference_kind(&instr, targets) {
                 let mut text = String::new();
                 formatter.format(&instr, &mut text);
                 found.push(Reference {
@@ -371,9 +472,52 @@ fn scan_mapping(
     found
 }
 
-/// Whether an instruction mentions `target`, and how.
-fn reference_kind(instr: &Instruction, target: u64) -> Option<RefKind> {
-    if instr.is_ip_rel_memory_operand() && instr.ip_rel_memory_address() == target {
+/// Pointer slots in one mapping. Like the xref scan, the last seven bytes
+/// are carried into the next chunk so a slot on the boundary is not missed;
+/// the overlap is deduplicated by slot address afterwards.
+fn scan_mapping_pointers(
+    reader: &dyn ReadBytes,
+    mapping: &Mapping,
+    lo: u64,
+    hi: u64,
+    control: &ScanControl,
+) -> Vec<Pointer> {
+    let mut found = Vec::new();
+    let mut chunk = vec![0_u8; SCAN_CHUNK];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut carry_addr = mapping.start;
+    let mut addr = mapping.start;
+    while addr < mapping.end && !control.cancelled() {
+        let len = usize::try_from((mapping.end - addr).min(SCAN_CHUNK as u64)).unwrap_or(0);
+        if len == 0 {
+            break;
+        }
+        read_filled(reader, addr, &mut chunk[..len]);
+        control.add_done(u64::try_from(len).unwrap_or(0));
+        let mut data = Vec::with_capacity(carry.len() + len);
+        data.extend_from_slice(&carry);
+        data.extend_from_slice(&chunk[..len]);
+        for (offset, bytes) in data.windows(8).enumerate() {
+            if control.cancelled() || found.len() >= POINTER_MAX_RESULTS {
+                return found;
+            }
+            let value = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+            if (lo..=hi).contains(&value) {
+                let slot = carry_addr.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
+                found.push(Pointer { slot, value });
+            }
+        }
+        let keep = data.len().min(7);
+        carry = data.split_off(data.len() - keep);
+        carry_addr = carry_addr.saturating_add(u64::try_from(data.len()).unwrap_or(0));
+        addr = addr.saturating_add(u64::try_from(len).unwrap_or(0));
+    }
+    found
+}
+
+/// Whether an instruction mentions an address in `targets`, and how.
+fn reference_kind(instr: &Instruction, targets: AddrRange) -> Option<RefKind> {
+    if instr.is_ip_rel_memory_operand() && targets.contains(instr.ip_rel_memory_address()) {
         return Some(RefKind::RipRelative);
     }
     for kind in instr.op_kinds() {
@@ -407,7 +551,9 @@ fn reference_kind(instr: &Instruction, target: u64) -> Option<RefKind> {
             ),
             _ => (None, RefKind::Immediate),
         };
-        if value == Some(target) {
+        if let Some(value) = value
+            && targets.contains(value)
+        {
             return Some(how);
         }
     }
@@ -468,6 +614,19 @@ mod tests {
         }
     }
 
+    /// Readable data, not code, for pointer tests.
+    fn data_mapping(start: u64, len: u64) -> Mapping {
+        Mapping {
+            perms: crate::maps::Perms {
+                read: true,
+                write: true,
+                exec: false,
+                shared: false,
+            },
+            ..mapping(start, len)
+        }
+    }
+
     #[test]
     fn decodes_known_instructions() {
         // push rbp; mov rbp, rsp; ret
@@ -519,7 +678,12 @@ mod tests {
         // mov rax,[rip+0x1000] at 0x1000: next ip 0x1007 + 0x1000 = 0x2007.
         let code = Bytes::at(0x1000, &[0x48, 0x8b, 0x05, 0x00, 0x10, 0x00, 0x00]);
         let control = ScanControl::new();
-        let found = scan(&code, &[mapping(0x1000, 7)], 0x2007, &control);
+        let found = scan(
+            &code,
+            &[mapping(0x1000, 7)],
+            AddrRange::one(0x2007),
+            &control,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].addr, 0x1000);
         assert_eq!(found[0].kind, RefKind::RipRelative);
@@ -539,12 +703,22 @@ mod tests {
         );
         let map = mapping(0x1000, 20);
         let control = ScanControl::new();
-        let found = scan(&code, std::slice::from_ref(&map), 0x1234, &control);
+        let found = scan(
+            &code,
+            std::slice::from_ref(&map),
+            AddrRange::one(0x1234),
+            &control,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].kind, RefKind::Immediate);
 
         let control = ScanControl::new();
-        let found = scan(&code, std::slice::from_ref(&map), 0x2000, &control);
+        let found = scan(
+            &code,
+            std::slice::from_ref(&map),
+            AddrRange::one(0x2000),
+            &control,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].kind, RefKind::Absolute);
         assert_eq!(found[0].addr, 0x100a);
@@ -561,7 +735,12 @@ mod tests {
         let target = instr_addr + 7 + 0x42;
         let code = Bytes::at(0x1_0000, &data);
         let control = ScanControl::new();
-        let found = scan(&code, &[mapping(0x1_0000, len as u64)], target, &control);
+        let found = scan(
+            &code,
+            &[mapping(0x1_0000, len as u64)],
+            AddrRange::one(target),
+            &control,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].addr, instr_addr);
     }
@@ -571,7 +750,12 @@ mod tests {
         let code = Bytes::at(0x1000, &[0x48, 0x8b, 0x05, 0x00, 0x10, 0x00, 0x00]);
         let control = ScanControl::new();
         control.cancel();
-        let found = scan(&code, &[mapping(0x1000, 7)], 0x2007, &control);
+        let found = scan(
+            &code,
+            &[mapping(0x1000, 7)],
+            AddrRange::one(0x2007),
+            &control,
+        );
         assert!(found.is_empty());
         assert_eq!(control.progress(), (0, 7));
     }
@@ -612,7 +796,7 @@ mod tests {
         let found = scan(
             &code,
             &[mapping(base, u64::try_from(data.len()).unwrap())],
-            target,
+            AddrRange::one(target),
             &control,
         );
         assert_eq!(found.len(), XREF_MAX_RESULTS);
@@ -625,8 +809,117 @@ mod tests {
         let mut data = mapping(0x1000, 7);
         data.perms.exec = false;
         let control = ScanControl::new();
-        let found = scan(&code, &[data], 0x2007, &control);
+        let found = scan(&code, &[data], AddrRange::one(0x2007), &control);
         assert!(found.is_empty());
         assert_eq!(control.progress(), (0, 0));
+    }
+
+    #[test]
+    fn a_span_matches_several_addresses() {
+        // mov rax,[rip+0xff9] at 0x1000 -> 0x2000; at 0x1007 -> 0x2008.
+        let code = Bytes::at(
+            0x1000,
+            &[
+                0x48, 0x8b, 0x05, 0xf9, 0x0f, 0x00, 0x00, 0x48, 0x8b, 0x05, 0xfa, 0x0f, 0x00, 0x00,
+            ],
+        );
+        let map = mapping(0x1000, 14);
+        let control = ScanControl::new();
+        let found = scan(
+            &code,
+            std::slice::from_ref(&map),
+            AddrRange::span(0x2000, 0x2008),
+            &control,
+        );
+        assert_eq!(found.len(), 2);
+
+        let control = ScanControl::new();
+        let found = scan(
+            &code,
+            std::slice::from_ref(&map),
+            AddrRange::one(0x2000),
+            &control,
+        );
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn a_span_accepts_its_ends_in_either_order() {
+        let range = AddrRange::span(0x3000, 0x2000);
+        assert_eq!((range.lo, range.hi), (0x2000, 0x3000));
+        assert!(range.contains(0x2800));
+        assert!(!range.contains(0x1fff));
+    }
+
+    #[test]
+    fn pointer_scan_lists_exact_pointers_first() {
+        let target = 0x142a_2374c_u64;
+        let mut data = vec![0_u8; 64];
+        data[8..16].copy_from_slice(&(target - 0x18).to_le_bytes());
+        data[16..24].copy_from_slice(&target.to_le_bytes());
+        data[24..32].copy_from_slice(&(target - POINTER_WINDOW - 8).to_le_bytes());
+        data[40..48].copy_from_slice(&0x1234_u64.to_le_bytes());
+        let code = Bytes::at(0x1_0000, &data);
+        let control = ScanControl::new();
+        let found = scan_pointers(&code, &[data_mapping(0x1_0000, 64)], target, &control);
+        assert_eq!(
+            found,
+            [
+                Pointer {
+                    slot: 0x1_0010,
+                    value: target,
+                },
+                Pointer {
+                    slot: 0x1_0008,
+                    value: target - 0x18,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pointer_scan_skips_unreadable_mappings() {
+        let target = 0x142a_2374c_u64;
+        let mut data = vec![0_u8; 16];
+        data[8..16].copy_from_slice(&target.to_le_bytes());
+        let code = Bytes::at(0x1_0000, &data);
+        let mut no_read = data_mapping(0x1_0000, 16);
+        no_read.perms.read = false;
+        let control = ScanControl::new();
+        let found = scan_pointers(&code, &[no_read], target, &control);
+        assert_eq!(found, []);
+        assert_eq!(control.progress(), (0, 0));
+    }
+
+    #[test]
+    fn pointer_scan_skips_read_only_mappings() {
+        let target = 0x142a_2374c_u64;
+        let mut data = vec![0_u8; 16];
+        data[8..16].copy_from_slice(&target.to_le_bytes());
+        let code = Bytes::at(0x1_0000, &data);
+        let mut read_only = data_mapping(0x1_0000, 16);
+        read_only.perms.write = false;
+        let control = ScanControl::new();
+        let found = scan_pointers(&code, &[read_only], target, &control);
+        assert_eq!(found, []);
+    }
+
+    #[test]
+    fn a_pointer_straddling_a_chunk_is_found_once() {
+        let target = 0x142a_2374c_u64;
+        let len = SCAN_CHUNK + 64;
+        let mut data = vec![0x11_u8; len];
+        let at = SCAN_CHUNK - 4;
+        data[at..at + 8].copy_from_slice(&target.to_le_bytes());
+        let code = Bytes::at(0x1_0000, &data);
+        let control = ScanControl::new();
+        let found = scan_pointers(
+            &code,
+            &[data_mapping(0x1_0000, u64::try_from(len).unwrap())],
+            target,
+            &control,
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].slot, 0x1_0000 + u64::try_from(at).unwrap());
     }
 }

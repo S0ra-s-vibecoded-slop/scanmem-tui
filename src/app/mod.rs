@@ -24,7 +24,7 @@ use crate::scripts::paths::ScriptsRoot;
 use crate::scripts::store::Scripts;
 use crate::stats::Stats;
 use anyhow::{Context, Result};
-use codetab::{CodeView, XrefJob};
+use codetab::{CodeView, PointerJob, XrefJob};
 use jobs::Job;
 use picker::Picker;
 use rangescan::RangeJob;
@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-pub use codetab::CodeFocus;
+pub use codetab::{CodeFocus, Sidebar};
 pub use results::ResultRow;
 pub use saved::Saved;
 
@@ -94,6 +94,8 @@ pub enum InputKind {
     GotoCode,
     /// Find instructions that encode a label or address.
     FindRefs,
+    /// Find memory slots that hold a pointer to a label or address.
+    FindPointers,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +135,8 @@ pub struct App {
     pub range_job: Option<RangeJob>,
     /// The reference scan running on its own thread, if any.
     pub xref_job: Option<XrefJob>,
+    /// The pointer scan running on its own thread, if any.
+    pub pointer_job: Option<PointerJob>,
 
     pub freezer: Freezer,
     pub stats: Stats,
@@ -193,6 +197,7 @@ impl App {
         self.drain_backend_events();
         self.drain_range_job();
         self.drain_xref_job();
+        self.drain_pointer_job();
         self.drain_script_events();
         self.refresh_live_values_if_due();
         self.refresh_stats_if_due();
@@ -209,7 +214,10 @@ impl App {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.job.is_some() || self.range_job.is_some() || self.xref_job.is_some()
+        self.job.is_some()
+            || self.range_job.is_some()
+            || self.xref_job.is_some()
+            || self.pointer_job.is_some()
     }
 
     fn new(
@@ -227,6 +235,7 @@ impl App {
             job: None,
             range_job: None,
             xref_job: None,
+            pointer_job: None,
             freezer,
             stats: Stats::new(),
             target: None,

@@ -170,30 +170,38 @@ fn prompt_title(app: &App, kind: InputKind) -> String {
                 .to_string()
         }
         InputKind::FindRefs => {
-            " Find references to: <label|module+0xoffset|hex address> ".to_string()
+            " Find references to: <label|module+0xoffset|hex address|addr..addr> ".to_string()
+        }
+        InputKind::FindPointers => {
+            " Find pointers to: <label|module+0xoffset|hex address> ".to_string()
         }
     }
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let line = match (&app.job, &app.range_job, &app.xref_job) {
-        (Some(job), _, _) => spinner_line(
+    let line = match (&app.job, &app.range_job, &app.xref_job, &app.pointer_job) {
+        (Some(job), _, _, _) => spinner_line(
             job.label,
             job.progress
                 .map(|(done, total)| format!("region {done}/{total}")),
             job.since,
         ),
-        (None, Some(range), _) => spinner_line(
+        (None, Some(range), _, _) => spinner_line(
             range.label,
             range.percent().map(|percent| format!("{percent}%")),
             range.since,
         ),
-        (None, None, Some(xref)) => spinner_line(
+        (None, None, Some(xref), _) => spinner_line(
             "Finding references",
             xref.percent().map(|percent| format!("{percent}%")),
             xref.since,
         ),
-        (None, None, None) => Line::styled(
+        (None, None, None, Some(pointer)) => spinner_line(
+            "Finding pointers",
+            pointer.percent().map(|percent| format!("{percent}%")),
+            pointer.since,
+        ),
+        (None, None, None, None) => Line::styled(
             app.status.text.clone(),
             Style::new().fg(level_color(app.status.level)),
         ),

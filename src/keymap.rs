@@ -28,6 +28,7 @@ pub enum Action {
     SwitchToCode,
     OpenInCode,
     FindRefs,
+    FindPointers,
     GotoCode,
     CodeOpen,
     CodeBack,
@@ -70,7 +71,8 @@ impl Action {
             | Action::CodeBack
             | Action::CodeCancel
             | Action::ToggleBytes
-            | Action::RescanRefs => tab == Tab::Code,
+            | Action::RescanRefs
+            | Action::FindPointers => tab == Tab::Code,
             Action::ToggleScript
             | Action::EditScript
             | Action::ImportScript
@@ -255,7 +257,11 @@ static BINDINGS: &[Binding] = &[
     },
     Binding {
         section: Code, action: FindRefs, keys: &[ch('f')],
-        label: "f", hint: "f refs", help: "search executable memory for instructions that encode <label|addr>",
+        label: "f", hint: "f refs", help: "search executable memory for instructions that encode <label|addr>; `addr-0x100..addr` also matches a struct's base",
+    },
+    Binding {
+        section: Code, action: FindPointers, keys: &[ch('P')],
+        label: "P", hint: "P ptrs", help: "find memory slots holding a pointer to <label|addr>, or to up to 0x1000 bytes before it",
     },
     Binding {
         section: Code, action: CodeOpen, keys: &[KeyCode::Enter],
@@ -267,7 +273,7 @@ static BINDINGS: &[Binding] = &[
     },
     Binding {
         section: Code, action: CodeCancel, keys: &[KeyCode::Esc],
-        label: "Esc", hint: "", help: "stop a reference scan, then step back",
+        label: "Esc", hint: "", help: "stop a running scan, then step back",
     },
     Binding {
         section: Code, action: ToggleBytes, keys: &[ch('b')],
@@ -275,7 +281,7 @@ static BINDINGS: &[Binding] = &[
     },
     Binding {
         section: Code, action: RescanRefs, keys: &[ch('r')],
-        label: "r", hint: "r rescan", help: "run the reference scan again",
+        label: "r", hint: "r rescan", help: "run the reference or pointer scan again",
     },
     Binding {
         section: General, action: AddAddress, keys: &[ch('A')],
@@ -494,6 +500,11 @@ mod tests {
             Some(RescanRefs)
         );
         assert_eq!(
+            action_for(ch('P'), Tab::Code, Focus::Results),
+            Some(FindPointers)
+        );
+        assert_eq!(action_for(ch('P'), Tab::Memory, Focus::Results), None);
+        assert_eq!(
             action_for(KeyCode::Tab, Tab::Code, Focus::Results),
             Some(SwitchPane)
         );
@@ -526,6 +537,7 @@ mod tests {
     fn code_hints_replace_memory_hints() {
         let hints = hint_line(Tab::Code, Focus::Results);
         assert!(hints.contains("f refs") && hints.contains("g goto"));
+        assert!(hints.contains("P ptrs"));
         assert!(hints.contains("Enter open") && hints.contains("u back"));
         assert!(!hints.contains("s scan"));
         assert!(!hints.contains("Space freeze"));
@@ -571,6 +583,8 @@ mod tests {
         assert!(help.contains("pick the target process"));
         assert!(help.contains("start or stop the selected script"));
         assert!(help.contains("search executable memory"));
+        assert!(help.contains("find memory slots"));
+        assert!(help.contains("find memory slots"));
         assert!(!help.contains("\n  \n"));
     }
 }

@@ -1,8 +1,8 @@
 //! The Code tab: mappings or references on the left, disassembly on the right.
 
 use super::{dim, framed};
-use crate::app::{App, CodeFocus};
-use crate::code::Flow;
+use crate::app::{App, CodeFocus, Sidebar};
+use crate::code::{Flow, POINTER_WINDOW};
 use crate::maps;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -18,10 +18,10 @@ pub fn draw_code(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
-    if app.code.showing_refs {
-        draw_refs(f, app, area);
-    } else {
-        draw_mappings(f, app, area);
+    match app.code.sidebar {
+        Sidebar::Refs => draw_refs(f, app, area),
+        Sidebar::Pointers => draw_pointers(f, app, area),
+        Sidebar::Mappings => draw_mappings(f, app, area),
     }
 }
 
@@ -59,22 +59,22 @@ fn draw_mappings(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_refs(f: &mut Frame, app: &mut App, area: Rect) {
-    let target = app.code.ref_target.unwrap_or_default();
+    let range = app.code.ref_range.unwrap_or_default();
     let what = app
         .code
         .ref_label
         .clone()
-        .unwrap_or_else(|| format!("0x{target:x}"));
+        .unwrap_or_else(|| range.to_string());
     let count = app.code.refs.len();
     let title = format!(" References to {what} ({count}) ");
     let block = pane_block(title, app.code.focus == CodeFocus::Sidebar);
     if app.code.refs.is_empty() {
-        return placeholder(
-            f,
-            block,
-            area,
-            "No instruction encodes that address.\n\nHeap and stack values are usually reached through pointers, which a static scan cannot see.",
-        );
+        let message = if range.is_single() {
+            "No instruction encodes that address.\n\nHeap and stack values are usually reached through pointers, which a static scan cannot see."
+        } else {
+            "No instruction encodes an address in that range."
+        };
+        return placeholder(f, block, area, message);
     }
     let items: Vec<ListItem> = app
         .code
@@ -99,6 +99,62 @@ fn draw_refs(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, area, &mut state);
     app.code.ref_state = state;
+}
+
+fn draw_pointers(f: &mut Frame, app: &mut App, area: Rect) {
+    let target = app.code.pointer_target.unwrap_or_default();
+    let what = app
+        .code
+        .pointer_label
+        .clone()
+        .unwrap_or_else(|| format!("0x{target:x}"));
+    let count = app.code.pointers.len();
+    let title = format!(" Pointers to {what} ({count}) ");
+    let block = pane_block(title, app.code.focus == CodeFocus::Sidebar);
+    if app.code.pointers.is_empty() {
+        return placeholder(
+            f,
+            block,
+            area,
+            &format!(
+                "No slot holds a pointer to that address (or to the {POINTER_WINDOW:#x} bytes before it).\n\nThe access may be computed from a base register, or the pointer may live in a register or another object; a static scan cannot follow that."
+            ),
+        );
+    }
+    let items: Vec<ListItem> = app
+        .code
+        .pointers
+        .iter()
+        .map(|pointer| {
+            let delta = target.saturating_sub(pointer.value);
+            let arrow = if delta == 0 {
+                "exact".to_string()
+            } else {
+                format!("-0x{delta:x}")
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("0x{:x}", pointer.slot),
+                    Style::new().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} ",
+                        maps::format_module_offset(&app.code.mappings, pointer.slot)
+                    ),
+                    dim(),
+                ),
+                Span::styled(format!("→ {arrow}"), dim()),
+            ]))
+        })
+        .collect();
+    let mut state = app.code.pointer_state;
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight(app.code.focus == CodeFocus::Sidebar))
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, area, &mut state);
+    app.code.pointer_state = state;
 }
 
 fn draw_disassembly(f: &mut Frame, app: &mut App, area: Rect) {
