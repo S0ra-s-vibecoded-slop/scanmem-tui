@@ -70,6 +70,7 @@ impl App {
             Action::SwitchToScripts => self.tab = Tab::Scripts,
             Action::SwitchToCode => {
                 self.ensure_code();
+                self.code.refresh_maps();
                 self.tab = Tab::Code;
             }
             Action::OpenInCode => self.open_selected_in_code(),
@@ -77,6 +78,9 @@ impl App {
             Action::FindPointers => self.begin_find_pointers(),
             Action::GotoCode => self.begin_goto_code(),
             Action::CodeOpen => self.code_open(),
+            Action::OpenData => self.open_code_data(),
+            Action::MoveLeft => self.code_move_horizontal(-1),
+            Action::MoveRight => self.code_move_horizontal(1),
             Action::CodeBack => self.code_back(),
             Action::CodeCancel => self.code_cancel(),
             Action::ToggleBytes => self.toggle_code_bytes(),
@@ -148,9 +152,10 @@ impl App {
         }
     }
 
-    /// `x` on a results or saved row: show that address in the Code tab.
+    /// `x` on a results or saved row: Analyze. Code disassembles; data opens
+    /// the hex view and starts the bounded trace.
     fn open_selected_in_code(&mut self) {
-        let addr = match self.focus {
+        let picked = match self.focus {
             Focus::Results => self.results.selected().map(|row| row.m.addr),
             Focus::Saved => self
                 .saved
@@ -158,10 +163,16 @@ impl App {
                 .and_then(|index| self.saved.items.get(index))
                 .map(|item| item.addr),
         };
-        match addr {
-            Some(addr) => self.open_code_at(addr),
-            None => self.say(Level::Info, "Select an address first."),
-        }
+        let Some(addr) = picked else {
+            return self.say(Level::Info, "Select an address first.");
+        };
+        let label = self
+            .saved
+            .items
+            .iter()
+            .find(|item| item.addr == addr && !item.label.is_empty())
+            .map(|item| item.label.clone());
+        self.analyze_address(addr, label);
     }
 
     fn begin_scan_input(&mut self) {
@@ -170,7 +181,13 @@ impl App {
         }
     }
 
-    fn stop_scan(&mut self) {
+    /// `Esc` anywhere: stop whatever worker is running, in priority order.
+    pub(super) fn stop_scan(&mut self) {
+        if let Some(job) = &self.trace_job {
+            job.control.cancel();
+            self.say(Level::Info, "Stopping the trace…");
+            return;
+        }
         if let Some(job) = &self.pointer_job {
             job.control.cancel();
             self.say(Level::Info, "Stopping the pointer scan…");

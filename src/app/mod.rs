@@ -24,7 +24,7 @@ use crate::scripts::paths::ScriptsRoot;
 use crate::scripts::store::Scripts;
 use crate::stats::Stats;
 use anyhow::{Context, Result};
-use codetab::{CodeView, PointerJob, XrefJob};
+use codetab::{CodeView, PointerJob, TraceJob, XrefJob};
 use jobs::Job;
 use picker::Picker;
 use rangescan::RangeJob;
@@ -42,6 +42,8 @@ pub use saved::Saved;
 
 const LIVE_REFRESH: Duration = Duration::from_millis(250);
 const STATS_REFRESH: Duration = Duration::from_millis(1000);
+/// How often the Code tab re-reads `/proc/<pid>/maps`; modules load late.
+const MAPS_REFRESH: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -137,6 +139,8 @@ pub struct App {
     pub xref_job: Option<XrefJob>,
     /// The pointer scan running on its own thread, if any.
     pub pointer_job: Option<PointerJob>,
+    /// The Analyze/trace running on its own thread, if any.
+    pub trace_job: Option<TraceJob>,
 
     pub freezer: Freezer,
     pub stats: Stats,
@@ -170,13 +174,15 @@ pub struct App {
     redraw: bool,
     last_live: Instant,
     last_stats: Instant,
+    last_maps: Instant,
 }
 
 impl App {
     pub fn start(args: &Args) -> Result<App> {
         let (backend, events) = Backend::spawn(&args.scanmem).context("starting scanmem")?;
-        let freezer = Freezer::start(args.freeze_interval());
-        let engine = Engine::start(args.lua_full);
+        let interval = args.freeze_interval();
+        let freezer = Freezer::start(interval);
+        let engine = Engine::start(args.lua_full, interval);
         let mut scripts = Scripts::new(ScriptsRoot::from_arg(args.scripts_dir.as_deref()));
         let startup = scripts.load_startup();
         let mut app = App::new(backend, events, freezer, engine, scripts, args.scan_type);
@@ -198,9 +204,11 @@ impl App {
         self.drain_range_job();
         self.drain_xref_job();
         self.drain_pointer_job();
+        self.drain_trace_job();
         self.drain_script_events();
         self.refresh_live_values_if_due();
         self.refresh_stats_if_due();
+        self.refresh_code_maps_if_due();
         self.keep_spinner_turning();
     }
 
@@ -218,6 +226,7 @@ impl App {
             || self.range_job.is_some()
             || self.xref_job.is_some()
             || self.pointer_job.is_some()
+            || self.trace_job.is_some()
     }
 
     fn new(
@@ -236,6 +245,7 @@ impl App {
             range_job: None,
             xref_job: None,
             pointer_job: None,
+            trace_job: None,
             freezer,
             stats: Stats::new(),
             target: None,
@@ -262,6 +272,7 @@ impl App {
             redraw: true,
             last_live: Instant::now(),
             last_stats: Instant::now(),
+            last_maps: Instant::now(),
         }
     }
 
@@ -326,6 +337,22 @@ impl App {
         let memory = self.target.as_ref().and_then(|target| target.memory().ok());
         let changed = self.saved.refresh_live(memory) | self.results.refresh_live(memory);
         self.redraw |= changed;
+        self.refresh_code_notes();
+    }
+
+    /// Re-reads the Code tab's maps while it is on screen, so modules loaded
+    /// after attach (Wine DLLs, dlopen, JIT) show up without reattaching.
+    fn refresh_code_maps_if_due(&mut self) {
+        if self.tab != Tab::Code || self.code.pid.is_none() {
+            return;
+        }
+        if self.last_maps.elapsed() < MAPS_REFRESH {
+            return;
+        }
+        self.last_maps = Instant::now();
+        if self.code.refresh_maps() {
+            self.redraw = true;
+        }
     }
 
     fn refresh_stats_if_due(&mut self) {

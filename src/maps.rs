@@ -118,6 +118,41 @@ impl Mapping {
     }
 }
 
+/// Coarse classification used by Analyze and the trace report. The order is
+/// meaningful: module slots are the best static roots, so they sort first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RegionKind {
+    Module,
+    Heap,
+    Stack,
+    Anonymous,
+    Other,
+}
+
+impl RegionKind {
+    pub fn text(self) -> &'static str {
+        match self {
+            RegionKind::Module => "module",
+            RegionKind::Heap => "heap",
+            RegionKind::Stack => "stack",
+            RegionKind::Anonymous => "anon",
+            RegionKind::Other => "special",
+        }
+    }
+}
+
+/// What kind of region a mapping is. Executability is the caller's decision:
+/// the trace only scans writable memory, but Analyze checks it first.
+pub fn region_kind(mapping: &Mapping) -> RegionKind {
+    match mapping.path.as_deref() {
+        Some("[heap]") => RegionKind::Heap,
+        Some("[stack]") => RegionKind::Stack,
+        Some(path) if path.starts_with('/') => RegionKind::Module,
+        Some(_) => RegionKind::Other,
+        None => RegionKind::Anonymous,
+    }
+}
+
 /// Every mapping of `pid`, in address order.
 pub fn read_maps(pid: u32) -> io::Result<Vec<Mapping>> {
     let text = fs::read_to_string(format!("/proc/{pid}/maps"))?;
@@ -156,6 +191,15 @@ fn parse_line(line: &str) -> Option<Mapping> {
     })
 }
 
+/// Index to keep selected after the mapping list changes: the item with the
+/// same start when it still exists, otherwise `fallback` clamped into range.
+pub fn reselect_index(starts: &[u64], selected: Option<u64>, fallback: usize) -> usize {
+    selected
+        .and_then(|start| starts.iter().position(|other| *other == start))
+        .unwrap_or(fallback)
+        .min(starts.len().saturating_sub(1))
+}
+
 /// The mapping containing `addr`.
 pub fn mapping_at(mappings: &[Mapping], addr: u64) -> Option<&Mapping> {
     mappings.iter().find(|mapping| mapping.contains(addr))
@@ -170,6 +214,27 @@ pub fn module_base(mappings: &[Mapping], mapping: &Mapping) -> Option<u64> {
         .filter(|other| other.file_path() == Some(path))
         .map(|other| other.start)
         .min()
+}
+
+/// The load base implied by the module's executable segment. Some tools quote
+/// offsets relative to this rather than the lowest mapping; for a normal ELF
+/// or PE module the two are equal.
+pub fn exec_base(mappings: &[Mapping], mapping: &Mapping) -> Option<u64> {
+    let path = mapping.file_path()?;
+    mappings
+        .iter()
+        .filter(|other| other.file_path() == Some(path) && other.executable())
+        .map(|other| other.start.saturating_sub(other.offset))
+        .min()
+}
+
+/// Which base a `module+offset` resolution used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OffsetBase {
+    /// The module's lowest mapping, as every address in the UI is displayed.
+    LowestMapping,
+    /// The executable segment's load base, as debuggers usually quote it.
+    ExecSegment,
 }
 
 /// `some_module.so+0x1234`, or `[heap]+0x20`, for status lines and titles.
@@ -190,12 +255,18 @@ pub fn format_module_offset(mappings: &[Mapping], addr: u64) -> String {
 
 /// Resolves `module+0x1234` (file name or full path) to an address that is
 /// actually mapped. `module` may also be `[heap]` / `[stack]`.
-pub fn resolve_module_offset(mappings: &[Mapping], text: &str) -> Option<u64> {
+/// Resolves `module+0x…` and says which base was used. The displayed
+/// base is tried first, so every offset shown in the UI round-trips; an offset
+/// quoted from the executable segment still resolves.
+pub fn resolve_module_offset_with_base(
+    mappings: &[Mapping],
+    text: &str,
+) -> Option<(u64, OffsetBase)> {
     let (module, offset) = text.trim().rsplit_once('+')?;
     let offset = offset.trim();
     let offset = offset.strip_prefix("0x").unwrap_or(offset);
     let offset = u64::from_str_radix(offset, 16).ok()?;
-    let matches = |mapping: &Mapping| {
+    let is_module = |mapping: &Mapping| {
         let Some(path) = mapping.path.as_deref() else {
             return false;
         };
@@ -205,16 +276,25 @@ pub fn resolve_module_offset(mappings: &[Mapping], text: &str) -> Option<u64> {
                 .is_some_and(|name| name.to_string_lossy() == module)
             || path.ends_with(module)
     };
-    let base = mappings
+    let matched: Vec<&Mapping> = mappings
         .iter()
-        .filter(|mapping| matches(mapping))
+        .filter(|mapping| is_module(mapping))
+        .collect();
+    let lowest = matched
+        .iter()
         .map(|mapping| module_base(mappings, mapping).unwrap_or(mapping.start))
         .min()?;
-    let addr = base.checked_add(offset)?;
-    mappings
+    let exec = matched
         .iter()
-        .any(|mapping| mapping.contains(addr))
-        .then_some(addr)
+        .filter_map(|mapping| exec_base(mappings, mapping))
+        .min();
+    let mapped = |addr: u64| mappings.iter().any(|mapping| mapping.contains(addr));
+    let candidate = lowest.checked_add(offset).filter(|addr| mapped(*addr));
+    if let Some(addr) = candidate {
+        return Some((addr, OffsetBase::LowestMapping));
+    }
+    let addr = exec?.checked_add(offset).filter(|addr| mapped(*addr))?;
+    Some((addr, OffsetBase::ExecSegment))
 }
 
 #[cfg(test)]
@@ -276,19 +356,72 @@ mod tests {
     fn module_goto_matches_names_paths_and_validates_mapping() {
         let maps = parse_maps(MAPS);
         assert_eq!(
-            resolve_module_offset(&maps, "libc.so.6+0x10"),
+            resolve_module_offset_with_base(&maps, "libc.so.6+0x10").map(|(addr, _)| addr),
             Some(0x7f32_efdc_0010)
         );
         assert_eq!(
-            resolve_module_offset(&maps, "/usr/lib/libc.so.6+0x10"),
+            resolve_module_offset_with_base(&maps, "/usr/lib/libc.so.6+0x10").map(|(addr, _)| addr),
             Some(0x7f32_efdc_0010)
         );
         assert_eq!(
-            resolve_module_offset(&maps, "My Game.exe+0x10"),
+            resolve_module_offset_with_base(&maps, "My Game.exe+0x10").map(|(addr, _)| addr),
             Some(0x7f32_efd9_0010)
         );
-        assert_eq!(resolve_module_offset(&maps, "libc.so.6+0x50000"), None);
-        assert_eq!(resolve_module_offset(&maps, "libc.so.6"), None);
-        assert_eq!(resolve_module_offset(&maps, "nope+0x1"), None);
+        assert_eq!(
+            resolve_module_offset_with_base(&maps, "libc.so.6+0x50000"),
+            None
+        );
+        assert_eq!(resolve_module_offset_with_base(&maps, "libc.so.6"), None);
+        assert_eq!(resolve_module_offset_with_base(&maps, "nope+0x1"), None);
+    }
+
+    #[test]
+    fn goto_accepts_the_executable_segments_base_too() {
+        let maps = parse_maps(MAPS);
+        // The exec mapping sits at 0x…d90000 with file offset 0x2000, so its
+        // load base is 0x…d8e000. Offset 0x21000 is unmapped from the display
+        // base but lands in the module from the exec base.
+        assert_eq!(
+            resolve_module_offset_with_base(&maps, "My Game.exe+0x21000"),
+            Some((0x7f32_efda_f000, OffsetBase::ExecSegment))
+        );
+        assert_eq!(
+            resolve_module_offset_with_base(&maps, "My Game.exe+0x2000"),
+            Some((0x7f32_efd9_2000, OffsetBase::LowestMapping))
+        );
+        assert_eq!(
+            resolve_module_offset_with_base(&maps, "My Game.exe+0x10"),
+            Some((0x7f32_efd9_0010, OffsetBase::LowestMapping))
+        );
+        assert_eq!(exec_base(&maps, &maps[2]), Some(0x7f32_efd8_e000));
+        assert_eq!(exec_base(&maps, &maps[0]), None);
+    }
+
+    #[test]
+    fn reselect_keeps_the_start_and_clamps_a_missing_one() {
+        let starts = [0x1000, 0x2000, 0x3000];
+        assert_eq!(reselect_index(&starts, Some(0x2000), 0), 1);
+        assert_eq!(reselect_index(&starts, Some(0x9000), 2), 2);
+        assert_eq!(reselect_index(&starts, Some(0x9000), 99), 2);
+        assert_eq!(reselect_index(&[], Some(0x1000), 4), 0);
+    }
+
+    #[test]
+    fn region_kinds_separate_modules_heap_stack_and_anonymous() {
+        let mut maps = parse_maps(MAPS);
+        maps.push(Mapping {
+            start: 0x7000,
+            end: 0x8000,
+            perms: Perms::parse("rw-p").unwrap(),
+            offset: 0,
+            dev: "00:00".to_string(),
+            inode: 0,
+            path: Some("[stack]".to_string()),
+        });
+        assert_eq!(region_kind(&maps[0]), RegionKind::Anonymous);
+        assert_eq!(region_kind(&maps[1]), RegionKind::Heap);
+        assert_eq!(region_kind(&maps[2]), RegionKind::Module);
+        assert_eq!(region_kind(&maps[5]), RegionKind::Stack);
+        assert!(RegionKind::Module < RegionKind::Heap);
     }
 }

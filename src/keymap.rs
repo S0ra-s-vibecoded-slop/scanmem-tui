@@ -33,8 +33,11 @@ pub enum Action {
     CodeOpen,
     CodeBack,
     CodeCancel,
+    OpenData,
     ToggleBytes,
     RescanRefs,
+    MoveLeft,
+    MoveRight,
     ToggleScript,
     EditScript,
     ImportScript,
@@ -72,7 +75,10 @@ impl Action {
             | Action::CodeCancel
             | Action::ToggleBytes
             | Action::RescanRefs
-            | Action::FindPointers => tab == Tab::Code,
+            | Action::FindPointers
+            | Action::OpenData
+            | Action::MoveLeft
+            | Action::MoveRight => tab == Tab::Code,
             Action::ToggleScript
             | Action::EditScript
             | Action::ImportScript
@@ -185,7 +191,7 @@ static BINDINGS: &[Binding] = &[
     },
     Binding {
         section: Results, action: OpenInCode, keys: &[ch('x')],
-        label: "x", hint: "x code", help: "show the selected address's code in the Code tab",
+        label: "x", hint: "x analyze", help: "analyze: code disassembles, data opens hex and traces pointers back to a static root",
     },
     Binding {
         section: Saved, action: SetValue, keys: &[ch('w'), KeyCode::Enter],
@@ -221,7 +227,7 @@ static BINDINGS: &[Binding] = &[
     },
     Binding {
         section: Saved, action: OpenInCode, keys: &[ch('x')],
-        label: "x", hint: "x code", help: "show the address in the Code tab",
+        label: "x", hint: "x analyze", help: "analyze: code disassembles, data opens hex and traces pointers back to a static root",
     },
     Binding {
         section: Scripts, action: ToggleScript, keys: &[ch(' ')],
@@ -261,27 +267,39 @@ static BINDINGS: &[Binding] = &[
     },
     Binding {
         section: Code, action: FindPointers, keys: &[ch('P')],
-        label: "P", hint: "P ptrs", help: "find memory slots holding a pointer to <label|addr>, or to up to 0x1000 bytes before it",
+        label: "P", hint: "P ptrs", help: "find memory slots holding a pointer to <label|addr>, or to up to 0x1000 bytes before it; acts on the selected trace path's deepest slot too",
+    },
+    Binding {
+        section: Code, action: OpenData, keys: &[ch('o')],
+        label: "o", hint: "o data", help: "open data: the selected pointer's target, or the instruction's operand address, in the hex view",
     },
     Binding {
         section: Code, action: CodeOpen, keys: &[KeyCode::Enter],
-        label: "Enter", hint: "Enter open", help: "open the selected mapping or reference, or follow a direct branch",
+        label: "Enter", hint: "Enter open", help: "open the selected mapping/reference/path, follow a direct branch, or follow a code pointer in the hex view",
     },
     Binding {
         section: Code, action: CodeBack, keys: &[ch('u')],
-        label: "u", hint: "u back", help: "undo a jump, leave the reference list, or return to the sidebar",
+        label: "u", hint: "u back", help: "close the trace report or hex view, undo a jump, leave a list, or return to the sidebar",
     },
     Binding {
         section: Code, action: CodeCancel, keys: &[KeyCode::Esc],
-        label: "Esc", hint: "", help: "stop a running scan, then step back",
+        label: "Esc", hint: "", help: "stop a running scan/trace, close the trace report, close the hex view, then step back",
     },
     Binding {
         section: Code, action: ToggleBytes, keys: &[ch('b')],
-        label: "b", hint: "b bytes", help: "show or hide the instruction bytes",
+        label: "b", hint: "b bytes", help: "show or hide the instruction bytes; in the hex view cycle 8/16/32 bytes per row",
     },
     Binding {
         section: Code, action: RescanRefs, keys: &[ch('r')],
-        label: "r", hint: "r rescan", help: "run the reference or pointer scan again",
+        label: "r", hint: "r rescan", help: "run the trace, reference scan or pointer scan again",
+    },
+    Binding {
+        section: Code, action: MoveLeft, keys: &[KeyCode::Left],
+        label: "← →", hint: "", help: "move one byte in the hex view",
+    },
+    Binding {
+        section: Code, action: MoveRight, keys: &[KeyCode::Right],
+        label: "", hint: "", help: "",
     },
     Binding {
         section: General, action: AddAddress, keys: &[ch('A')],
@@ -505,6 +523,20 @@ mod tests {
         );
         assert_eq!(action_for(ch('P'), Tab::Memory, Focus::Results), None);
         assert_eq!(
+            action_for(ch('o'), Tab::Code, Focus::Results),
+            Some(OpenData)
+        );
+        assert_eq!(action_for(ch('o'), Tab::Memory, Focus::Results), None);
+        assert_eq!(
+            action_for(KeyCode::Left, Tab::Code, Focus::Results),
+            Some(MoveLeft)
+        );
+        assert_eq!(
+            action_for(KeyCode::Right, Tab::Code, Focus::Results),
+            Some(MoveRight)
+        );
+        assert_eq!(action_for(KeyCode::Left, Tab::Memory, Focus::Results), None);
+        assert_eq!(
             action_for(KeyCode::Tab, Tab::Code, Focus::Results),
             Some(SwitchPane)
         );
@@ -537,7 +569,7 @@ mod tests {
     fn code_hints_replace_memory_hints() {
         let hints = hint_line(Tab::Code, Focus::Results);
         assert!(hints.contains("f refs") && hints.contains("g goto"));
-        assert!(hints.contains("P ptrs"));
+        assert!(hints.contains("P ptrs") && hints.contains("o data"));
         assert!(hints.contains("Enter open") && hints.contains("u back"));
         assert!(!hints.contains("s scan"));
         assert!(!hints.contains("Space freeze"));
@@ -584,7 +616,7 @@ mod tests {
         assert!(help.contains("start or stop the selected script"));
         assert!(help.contains("search executable memory"));
         assert!(help.contains("find memory slots"));
-        assert!(help.contains("find memory slots"));
+        assert!(help.contains("hex view"));
         assert!(!help.contains("\n  \n"));
     }
 }

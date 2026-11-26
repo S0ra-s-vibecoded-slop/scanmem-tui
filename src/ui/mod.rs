@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use std::time::Instant;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -179,35 +179,54 @@ fn prompt_title(app: &App, kind: InputKind) -> String {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let line = match (&app.job, &app.range_job, &app.xref_job, &app.pointer_job) {
-        (Some(job), _, _, _) => spinner_line(
+    let line = match (
+        &app.job,
+        &app.range_job,
+        &app.xref_job,
+        &app.pointer_job,
+        &app.trace_job,
+    ) {
+        (Some(job), _, _, _, _) => spinner_line(
             job.label,
             job.progress
                 .map(|(done, total)| format!("region {done}/{total}")),
             job.since,
         ),
-        (None, Some(range), _, _) => spinner_line(
+        (None, Some(range), _, _, _) => spinner_line(
             range.label,
             range.percent().map(|percent| format!("{percent}%")),
             range.since,
         ),
-        (None, None, Some(xref), _) => spinner_line(
+        (None, None, Some(xref), _, _) => spinner_line(
             "Finding references",
             xref.percent().map(|percent| format!("{percent}%")),
             xref.since,
         ),
-        (None, None, None, Some(pointer)) => spinner_line(
+        (None, None, None, Some(pointer), _) => spinner_line(
             "Finding pointers",
             pointer.percent().map(|percent| format!("{percent}%")),
             pointer.since,
         ),
-        (None, None, None, None) => Line::styled(
+        (None, None, None, None, Some(trace)) => {
+            let phase = trace.progress.text();
+            let detail = trace
+                .percent()
+                .map(|percent| format!("{phase} · {percent}%"));
+            let what = trace
+                .label
+                .clone()
+                .unwrap_or_else(|| format!("0x{:x}", trace.target));
+            spinner_line(&format!("Analyzing {what}"), detail, trace.since)
+        }
+        (None, None, None, None, None) => Line::styled(
             app.status.text.clone(),
             Style::new().fg(level_color(app.status.level)),
         ),
     };
     f.render_widget(
-        Paragraph::new(line).block(framed(Color::DarkGray, " Status ")),
+        Paragraph::new(line)
+            .block(framed(Color::DarkGray, " Status "))
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
