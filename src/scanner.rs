@@ -63,7 +63,10 @@ impl ScanControl {
         self.cancel.load(Relaxed)
     }
 
+    /// Starts a new pass: the old progress belongs to whatever ran before,
+    /// so both counters are reset together.
     pub fn set_total(&self, total: u64) {
+        self.done.store(0, Relaxed);
         self.total.store(total, Relaxed);
     }
 
@@ -72,7 +75,7 @@ impl ScanControl {
         (self.done.load(Relaxed), self.total.load(Relaxed))
     }
 
-    fn add_done(&self, bytes: u64) {
+    pub(crate) fn add_done(&self, bytes: u64) {
         self.done.fetch_add(bytes, Relaxed);
     }
 }

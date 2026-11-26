@@ -43,6 +43,9 @@ impl App {
             InputKind::AddAddr => self.submit_address(text),
             InputKind::ImportScript => self.import_script(text),
             InputKind::NewScript => self.create_script(text),
+            InputKind::GotoCode => self.submit_goto_code(text),
+            InputKind::FindRefs => self.submit_find_refs(text),
+            InputKind::FindPointers => self.submit_find_pointers(text),
         }
     }
 

@@ -25,6 +25,19 @@ pub enum Action {
     SwitchPane,
     SwitchToMemory,
     SwitchToScripts,
+    SwitchToCode,
+    OpenInCode,
+    FindRefs,
+    FindPointers,
+    GotoCode,
+    CodeOpen,
+    CodeBack,
+    CodeCancel,
+    OpenData,
+    ToggleBytes,
+    RescanRefs,
+    MoveLeft,
+    MoveRight,
     ToggleScript,
     EditScript,
     ImportScript,
@@ -54,7 +67,18 @@ impl Action {
     /// Some general-looking keys only make sense on one tab.
     fn works_on(self, tab: Tab) -> bool {
         match self {
-            Action::AddAddress | Action::SwitchPane => tab == Tab::Memory,
+            Action::AddAddress | Action::OpenInCode => tab == Tab::Memory,
+            Action::SwitchPane => matches!(tab, Tab::Memory | Tab::Code),
+            Action::GotoCode
+            | Action::CodeOpen
+            | Action::CodeBack
+            | Action::CodeCancel
+            | Action::ToggleBytes
+            | Action::RescanRefs
+            | Action::FindPointers
+            | Action::OpenData
+            | Action::MoveLeft
+            | Action::MoveRight => tab == Tab::Code,
             Action::ToggleScript
             | Action::EditScript
             | Action::ImportScript
@@ -74,15 +98,17 @@ enum Section {
     Results,
     Saved,
     Scripts,
+    Code,
     General,
 }
 
 impl Section {
-    const ALL: [Section; 5] = [
+    const ALL: [Section; 6] = [
         Section::Scanning,
         Section::Results,
         Section::Saved,
         Section::Scripts,
+        Section::Code,
         Section::General,
     ];
 
@@ -92,6 +118,7 @@ impl Section {
             Section::Results => "Scan results",
             Section::Saved => "Saved addresses",
             Section::Scripts => "Scripts",
+            Section::Code => "Code view",
             Section::General => "General",
         }
     }
@@ -102,6 +129,7 @@ impl Section {
             Section::Saved => tab == Tab::Memory && focus == Focus::Saved,
             Section::Scanning => tab == Tab::Memory,
             Section::Scripts => tab == Tab::Scripts,
+            Section::Code => tab == Tab::Code,
             Section::General => true,
         }
     }
@@ -139,7 +167,7 @@ use Section::*;
 static BINDINGS: &[Binding] = &[
     Binding {
         section: Scanning, action: PickProcess, keys: &[ch('p')],
-        label: "p", hint: "p process", help: "pick the target process",
+        label: "p", hint: "p process", help: "pick the target process, by name or pid",
     },
     Binding {
         section: Scanning, action: StartScan, keys: &[ch('s'), ch('/')],
@@ -160,6 +188,10 @@ static BINDINGS: &[Binding] = &[
     Binding {
         section: Results, action: SaveResult, keys: &[ch('a'), KeyCode::Enter],
         label: "a/Enter", hint: "a/Enter save", help: "save the selected address to the list on the right",
+    },
+    Binding {
+        section: Results, action: OpenInCode, keys: &[ch('x')],
+        label: "x", hint: "x analyze", help: "analyze: code disassembles, data opens hex and traces pointers back to a static root",
     },
     Binding {
         section: Saved, action: SetValue, keys: &[ch('w'), KeyCode::Enter],
@@ -190,6 +222,14 @@ static BINDINGS: &[Binding] = &[
         label: "d", hint: "d delete", help: "remove from the list",
     },
     Binding {
+        section: Saved, action: FindRefs, keys: &[ch('f')],
+        label: "f", hint: "f refs", help: "search executable memory for instructions that encode this label/address",
+    },
+    Binding {
+        section: Saved, action: OpenInCode, keys: &[ch('x')],
+        label: "x", hint: "x analyze", help: "analyze: code disassembles, data opens hex and traces pointers back to a static root",
+    },
+    Binding {
         section: Scripts, action: ToggleScript, keys: &[ch(' ')],
         label: "Space", hint: "Space run/stop", help: "start or stop the selected script (all scripts start off)",
     },
@@ -218,6 +258,50 @@ static BINDINGS: &[Binding] = &[
         label: "r", hint: "r reload", help: "re-read the selected file from disk, restarting it when it is running",
     },
     Binding {
+        section: Code, action: GotoCode, keys: &[ch('g')],
+        label: "g", hint: "g goto", help: "go to a saved label, `module+0x…` offset, or hex address",
+    },
+    Binding {
+        section: Code, action: FindRefs, keys: &[ch('f')],
+        label: "f", hint: "f refs", help: "search executable memory for instructions that encode <label|addr>; `addr-0x100..addr` also matches a struct's base",
+    },
+    Binding {
+        section: Code, action: FindPointers, keys: &[ch('P')],
+        label: "P", hint: "P ptrs", help: "find memory slots holding a pointer to <label|addr>, or to up to 0x1000 bytes before it; acts on the selected trace path's deepest slot too",
+    },
+    Binding {
+        section: Code, action: OpenData, keys: &[ch('o')],
+        label: "o", hint: "o data", help: "open data: the selected pointer's target, or the instruction's operand address, in the hex view",
+    },
+    Binding {
+        section: Code, action: CodeOpen, keys: &[KeyCode::Enter],
+        label: "Enter", hint: "Enter open", help: "open the selected mapping/reference/path, follow a direct branch, or follow a code pointer in the hex view",
+    },
+    Binding {
+        section: Code, action: CodeBack, keys: &[ch('u')],
+        label: "u", hint: "u back", help: "close the trace report or hex view, undo a jump, leave a list, or return to the sidebar",
+    },
+    Binding {
+        section: Code, action: CodeCancel, keys: &[KeyCode::Esc],
+        label: "Esc", hint: "", help: "stop a running scan/trace, close the trace report, close the hex view, then step back",
+    },
+    Binding {
+        section: Code, action: ToggleBytes, keys: &[ch('b')],
+        label: "b", hint: "b bytes", help: "show or hide the instruction bytes; in the hex view cycle 8/16/32 bytes per row",
+    },
+    Binding {
+        section: Code, action: RescanRefs, keys: &[ch('r')],
+        label: "r", hint: "r rescan", help: "run the trace, reference scan or pointer scan again",
+    },
+    Binding {
+        section: Code, action: MoveLeft, keys: &[KeyCode::Left],
+        label: "← →", hint: "", help: "move one byte in the hex view",
+    },
+    Binding {
+        section: Code, action: MoveRight, keys: &[KeyCode::Right],
+        label: "", hint: "", help: "",
+    },
+    Binding {
         section: General, action: AddAddress, keys: &[ch('A')],
         label: "A", hint: "A add addr", help: "add an address by hand: 7ffc8dc5328c int32, or `label+0x10` / `0xaddr-0x1140`",
     },
@@ -227,10 +311,14 @@ static BINDINGS: &[Binding] = &[
     },
     Binding {
         section: General, action: SwitchToMemory, keys: &[ch('1')],
-        label: "1 2", hint: "1/2 tab", help: "switch between the memory and scripts tabs",
+        label: "1 2 3", hint: "1/2/3 tab", help: "switch between the memory, scripts and code tabs",
     },
     Binding {
         section: General, action: SwitchToScripts, keys: &[ch('2')],
+        label: "", hint: "", help: "",
+    },
+    Binding {
+        section: General, action: SwitchToCode, keys: &[ch('3')],
         label: "", hint: "", help: "",
     },
     Binding {
@@ -397,7 +485,95 @@ mod tests {
                 action_for(ch('2'), Tab::Memory, focus),
                 Some(SwitchToScripts)
             );
+            assert_eq!(action_for(ch('3'), Tab::Memory, focus), Some(SwitchToCode));
+            assert_eq!(action_for(ch('3'), Tab::Code, focus), Some(SwitchToCode));
         }
+    }
+
+    #[test]
+    fn code_keys_do_not_leak_into_other_tabs() {
+        assert_eq!(
+            action_for(ch('g'), Tab::Code, Focus::Results),
+            Some(GotoCode)
+        );
+        assert_eq!(action_for(ch('f'), Tab::Code, Focus::Saved), Some(FindRefs));
+        assert_eq!(
+            action_for(KeyCode::Enter, Tab::Code, Focus::Results),
+            Some(CodeOpen)
+        );
+        assert_eq!(
+            action_for(ch('u'), Tab::Code, Focus::Results),
+            Some(CodeBack)
+        );
+        assert_eq!(
+            action_for(KeyCode::Esc, Tab::Code, Focus::Results),
+            Some(CodeCancel)
+        );
+        assert_eq!(
+            action_for(ch('b'), Tab::Code, Focus::Results),
+            Some(ToggleBytes)
+        );
+        assert_eq!(
+            action_for(ch('r'), Tab::Code, Focus::Results),
+            Some(RescanRefs)
+        );
+        assert_eq!(
+            action_for(ch('P'), Tab::Code, Focus::Results),
+            Some(FindPointers)
+        );
+        assert_eq!(action_for(ch('P'), Tab::Memory, Focus::Results), None);
+        assert_eq!(
+            action_for(ch('o'), Tab::Code, Focus::Results),
+            Some(OpenData)
+        );
+        assert_eq!(action_for(ch('o'), Tab::Memory, Focus::Results), None);
+        assert_eq!(
+            action_for(KeyCode::Left, Tab::Code, Focus::Results),
+            Some(MoveLeft)
+        );
+        assert_eq!(
+            action_for(KeyCode::Right, Tab::Code, Focus::Results),
+            Some(MoveRight)
+        );
+        assert_eq!(action_for(KeyCode::Left, Tab::Memory, Focus::Results), None);
+        assert_eq!(
+            action_for(KeyCode::Tab, Tab::Code, Focus::Results),
+            Some(SwitchPane)
+        );
+        // `g` keeps its old meaning away from the Code tab.
+        assert_eq!(
+            action_for(ch('g'), Tab::Memory, Focus::Results),
+            Some(JumpToStart)
+        );
+        assert_eq!(action_for(ch('x'), Tab::Code, Focus::Results), None);
+    }
+
+    #[test]
+    fn x_and_f_identify_addresses_on_the_memory_tab() {
+        assert_eq!(
+            action_for(ch('x'), Tab::Memory, Focus::Results),
+            Some(OpenInCode)
+        );
+        assert_eq!(
+            action_for(ch('x'), Tab::Memory, Focus::Saved),
+            Some(OpenInCode)
+        );
+        assert_eq!(
+            action_for(ch('f'), Tab::Memory, Focus::Saved),
+            Some(FindRefs)
+        );
+        assert_eq!(action_for(ch('f'), Tab::Memory, Focus::Results), None);
+    }
+
+    #[test]
+    fn code_hints_replace_memory_hints() {
+        let hints = hint_line(Tab::Code, Focus::Results);
+        assert!(hints.contains("f refs") && hints.contains("g goto"));
+        assert!(hints.contains("P ptrs") && hints.contains("o data"));
+        assert!(hints.contains("Enter open") && hints.contains("u back"));
+        assert!(!hints.contains("s scan"));
+        assert!(!hints.contains("Space freeze"));
+        assert!(hints.ends_with("q quit"));
     }
 
     #[test]
@@ -438,6 +614,9 @@ mod tests {
         }
         assert!(help.contains("pick the target process"));
         assert!(help.contains("start or stop the selected script"));
+        assert!(help.contains("search executable memory"));
+        assert!(help.contains("find memory slots"));
+        assert!(help.contains("hex view"));
         assert!(!help.contains("\n  \n"));
     }
 }

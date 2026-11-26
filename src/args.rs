@@ -53,6 +53,8 @@ impl Args {
         self.pid_flag.or(self.pid_arg)
     }
 
+    /// The freezer write interval. It also paces Lua `on_tick`, so scripts
+    /// and the freezer run on the same cadence.
     pub fn freeze_interval(&self) -> Duration {
         Duration::from_millis(self.freeze_ms)
     }

@@ -5,6 +5,7 @@ use crate::keymap::{self, Action};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 const PAGE: isize = 10;
+const HELP_PAGE: u16 = 10;
 const JUMP_TO_START: isize = isize::MIN / 2;
 const JUMP_TO_END: isize = isize::MAX / 2;
 
@@ -22,7 +23,28 @@ impl App {
             Mode::Input(kind) => self.on_input_key(kind, key),
             Mode::Confirm(confirm) => self.on_confirm_key(confirm, key),
             Mode::Picker => self.on_picker_key(key),
-            Mode::Help => self.mode = Mode::Normal,
+            Mode::Help => self.on_help_key(key),
+        }
+    }
+
+    /// The help popup scrolls; any other key closes it.
+    fn on_help_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                self.help_scroll = self.help_scroll.saturating_sub(HELP_PAGE);
+            }
+            KeyCode::PageDown => {
+                self.help_scroll = self.help_scroll.saturating_add(HELP_PAGE);
+            }
+            KeyCode::Home => self.help_scroll = 0,
+            KeyCode::End => self.help_scroll = u16::MAX,
+            _ => self.mode = Mode::Normal,
         }
     }
 
@@ -39,13 +61,30 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Help => self.mode = Mode::Help,
-            Action::SwitchPane => {
-                if self.tab == Tab::Memory {
-                    self.switch_pane();
-                }
-            }
+            Action::SwitchPane => match self.tab {
+                Tab::Memory => self.switch_pane(),
+                Tab::Code => self.switch_code_focus(),
+                Tab::Scripts => {}
+            },
             Action::SwitchToMemory => self.tab = Tab::Memory,
             Action::SwitchToScripts => self.tab = Tab::Scripts,
+            Action::SwitchToCode => {
+                self.ensure_code();
+                self.code.refresh_maps();
+                self.tab = Tab::Code;
+            }
+            Action::OpenInCode => self.open_selected_in_code(),
+            Action::FindRefs => self.begin_find_refs(),
+            Action::FindPointers => self.begin_find_pointers(),
+            Action::GotoCode => self.begin_goto_code(),
+            Action::CodeOpen => self.code_open(),
+            Action::OpenData => self.open_code_data(),
+            Action::MoveLeft => self.code_move_horizontal(-1),
+            Action::MoveRight => self.code_move_horizontal(1),
+            Action::CodeBack => self.code_back(),
+            Action::CodeCancel => self.code_cancel(),
+            Action::ToggleBytes => self.toggle_code_bytes(),
+            Action::RescanRefs => self.rescan_refs(),
             Action::MoveUp => self.move_selection(-1),
             Action::MoveDown => self.move_selection(1),
             Action::MovePageUp => self.page(-PAGE),
@@ -84,9 +123,16 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.tab == Tab::Scripts {
-            self.scripts.move_selection(delta);
-            return;
+        match self.tab {
+            Tab::Scripts => {
+                self.scripts.move_selection(delta);
+                return;
+            }
+            Tab::Code => {
+                self.code_move(delta);
+                return;
+            }
+            Tab::Memory => {}
         }
         match self.focus {
             Focus::Results => {
@@ -99,11 +145,34 @@ impl App {
 
     /// PgUp/PgDn scroll the script preview, or move table selections in memory.
     fn page(&mut self, delta: isize) {
-        if self.tab == Tab::Scripts {
-            self.scripts.scroll_preview(delta);
-        } else {
-            self.move_selection(delta);
+        match self.tab {
+            Tab::Scripts => self.scripts.scroll_preview(delta),
+            Tab::Code => self.code_move(delta),
+            Tab::Memory => self.move_selection(delta),
         }
+    }
+
+    /// `x` on a results or saved row: Analyze. Code disassembles; data opens
+    /// the hex view and starts the bounded trace.
+    fn open_selected_in_code(&mut self) {
+        let picked = match self.focus {
+            Focus::Results => self.results.selected().map(|row| row.m.addr),
+            Focus::Saved => self
+                .saved
+                .selected()
+                .and_then(|index| self.saved.items.get(index))
+                .map(|item| item.addr),
+        };
+        let Some(addr) = picked else {
+            return self.say(Level::Info, "Select an address first.");
+        };
+        let label = self
+            .saved
+            .items
+            .iter()
+            .find(|item| item.addr == addr && !item.label.is_empty())
+            .map(|item| item.label.clone());
+        self.analyze_address(addr, label);
     }
 
     fn begin_scan_input(&mut self) {
@@ -112,7 +181,23 @@ impl App {
         }
     }
 
-    fn stop_scan(&mut self) {
+    /// `Esc` anywhere: stop whatever worker is running, in priority order.
+    pub(super) fn stop_scan(&mut self) {
+        if let Some(job) = &self.trace_job {
+            job.control.cancel();
+            self.say(Level::Info, "Stopping the trace…");
+            return;
+        }
+        if let Some(job) = &self.pointer_job {
+            job.control.cancel();
+            self.say(Level::Info, "Stopping the pointer scan…");
+            return;
+        }
+        if let Some(job) = &self.xref_job {
+            job.control.cancel();
+            self.say(Level::Info, "Stopping the reference scan…");
+            return;
+        }
         if let Some(job) = &self.range_job {
             job.control.cancel();
             self.say(Level::Info, "Stopping range scan…");

@@ -20,8 +20,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// How often `on_tick` runs while a script is enabled.
-const TICK: Duration = Duration::from_millis(100);
 /// What one callback (`on_start`, `on_tick`, `on_stop`, or the top level) may
 /// spend before it is aborted.
 const BUDGET: Duration = Duration::from_millis(20);
@@ -97,12 +95,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn start(full_stdlib: bool) -> Engine {
+    pub fn start(full_stdlib: bool, tick: Duration) -> Engine {
         let (commands, command_rx) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("lua".into())
-            .spawn(move || Worker::new(command_rx, event_tx, full_stdlib).run())
+            .spawn(move || Worker::new(command_rx, event_tx, full_stdlib, tick).run())
             .expect("spawn the Lua engine thread");
         Engine {
             commands: Some(commands),
@@ -487,10 +485,16 @@ struct Worker {
     full_stdlib: bool,
     scripts: HashMap<u64, Script>,
     last_tick: Instant,
+    tick: Duration,
 }
 
 impl Worker {
-    fn new(commands: Receiver<Command>, events: Sender<Event>, full_stdlib: bool) -> Worker {
+    fn new(
+        commands: Receiver<Command>,
+        events: Sender<Event>,
+        full_stdlib: bool,
+        tick: Duration,
+    ) -> Worker {
         Worker {
             commands,
             events,
@@ -499,12 +503,13 @@ impl Worker {
             full_stdlib,
             scripts: HashMap::new(),
             last_tick: Instant::now(),
+            tick,
         }
     }
 
     fn run(mut self) {
         loop {
-            let wait = TICK.saturating_sub(self.last_tick.elapsed());
+            let wait = self.tick.saturating_sub(self.last_tick.elapsed());
             match self.commands.recv_timeout(wait) {
                 Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(command) => self.handle(command),
@@ -513,7 +518,7 @@ impl Worker {
             if self.drain() {
                 break;
             }
-            if self.last_tick.elapsed() >= TICK {
+            if self.last_tick.elapsed() >= self.tick {
                 self.tick();
                 self.last_tick = Instant::now();
             }
@@ -878,6 +883,7 @@ fn unfreeze(shared: &Arc<Shared>, name: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEST_TICK: Duration = Duration::from_millis(100);
 
     /// A small byte array standing in for `/proc/<pid>/mem`.
     struct Fake {
@@ -932,7 +938,7 @@ mod tests {
 
     fn start(source: &str, full_stdlib: bool) -> (Arc<Fake>, Engine) {
         let memory = Fake::new(0x1000, 0x100);
-        let engine = Engine::start(full_stdlib);
+        let engine = Engine::start(full_stdlib, TEST_TICK);
         engine.set_memory(Some(memory.clone()));
         engine.set_labels(vec![health(false)]);
         engine.enable(1, "test.lua".into(), source.into());
@@ -1128,7 +1134,7 @@ mod tests {
     #[test]
     fn writes_to_a_frozen_label_warn() {
         let memory = Fake::new(0x1000, 0x100);
-        let engine = Engine::start(false);
+        let engine = Engine::start(false, TEST_TICK);
         engine.set_memory(Some(memory));
         engine.set_labels(vec![health(true)]);
         engine.enable(
